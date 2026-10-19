@@ -45,7 +45,8 @@
   "STRATA_GLM_CPU_LANE": "0",
   "STRATA_GLM_PREFILL_CPU": "0",
   "STRATA_GLM_LOOKUP": "1",
-  "STRATA_MIMO_KV8": "1"
+  "STRATA_MIMO_KV8": "1",
+  "STRATA_GLM_ABLATE_TOKENS": "64"
  },
  "vision": {
   "exe": "tools/mimo/mimo_vision.py",

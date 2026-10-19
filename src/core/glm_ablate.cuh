@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -102,6 +103,14 @@ inline State& state() {
 
 inline bool on() { return state().on; }
 
+/// STRATA_GLM_ABLATE_TOKENS=N (generate.cpp): the steering is live while a prompt is read and for the answer's first
+/// N tokens, then off for the rest of the request - a refusal is decided at the start, while steering every token of a
+/// long answer piles up damage (MiMo-V2.6-Pro: long Russian answers looped and coined words at every strength >= 0.2).
+inline std::atomic<bool>& live() {
+    static std::atomic<bool> l{true};
+    return l;
+}
+
 /// The table on the CURRENT device (uploaded on first use), or nullptr when off or of another width.
 inline const float* vec(int E) {
     State& a = state();
@@ -126,7 +135,7 @@ inline const float* vec(int E) {
 /// Outputs mode: T rows of E values at X (row stride E): x <- x - scale (x . v) v for the file's vectors.
 inline void rows(float* X, int T, int E, cudaStream_t s) {
     State& a = state();
-    if (!a.on || a.layers > 0 || X == nullptr || T <= 0) return;
+    if (!a.on || !live().load(std::memory_order_relaxed) || a.layers > 0 || X == nullptr || T <= 0) return;
     const float* v = vec(E);
     if (v == nullptr) return;
     rows_kernel<<<T, 256, 0, s>>>(X, v, E, (int) (a.host.size() / (size_t) E), a.scale);
@@ -135,7 +144,8 @@ inline void rows(float* X, int T, int E, cudaStream_t s) {
 /// Per-layer mode: the same on T rows with layer `layer`'s vectors (no-op in outputs mode or for an unsteered layer).
 inline void layer_rows(int layer, float* X, int T, int E, cudaStream_t s) {
     State& a = state();
-    if (!a.on || a.layers <= 0 || layer < 0 || layer >= a.layers || !a.steered[(size_t) layer] || X == nullptr || T <= 0)
+    if (!a.on || !live().load(std::memory_order_relaxed) || a.layers <= 0 || layer < 0 || layer >= a.layers ||
+        !a.steered[(size_t) layer] || X == nullptr || T <= 0)
         return;
     const float* v = vec(E);
     if (v == nullptr) return;

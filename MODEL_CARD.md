@@ -62,12 +62,14 @@ MTP drafting, attention kernels, INT8 KV cache and vision path are what the numb
   three MTP layers Q4_K (their fused q/k/v re-dequantized tensor-parallel-aware — the stock conversion scrambles them);
   router and norms F32.
 - **Refusal vector:** six directions per layer measured on harmful vs harmless instructions, projected out of the
-  residual stream after every layer at strength 0.35.
+  residual stream after every layer at strength 0.35 — for the prompt and the first 64 answer tokens only
+  (`STRATA_GLM_ABLATE_TOKENS=64`): steering every token made long Russian answers loop.
 
 | Strength of the vector | Russian perplexity | English perplexity | JailbreakBench refusals / 40 |
 | --- | --- | --- | --- |
 | 0 | 4.03 | 4.25 | 24 |
-| **0.35 (default)** | **5.12** | **4.06** | **1** |
+| 0.35, every token | 5.12 | 4.06 | 1 (long answers degrade) |
+| **0.35, first 64 tokens (default)** | — | — | **5** |
 
 (The full-precision model: Russian perplexity ≈ 3.8. Refusals judged by the same quant without the vector.)
 

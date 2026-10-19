@@ -722,6 +722,8 @@ public:
     /// leaves them behind on a split).  `next`: the token after the piece (-1: unknown).  No logits.
     /// prompt_window_ready(): a split whose window is set up (mimo2; STRATA_GLM_PROMPT_WIN=0 turns it off).
     bool prompt_window_ready() const;
+    /// STRATA_GLM_ABLATE_TOKENS: the refusal vector's steering on (prompt, answer start) or off (the rest of an answer)
+    static void ablate_live(bool on);
     /// decode_mtp_pipe's prompt-lookup drafts (STRATA_GLM_LOOKUP=1) read the context from here: the request's prompt,
     /// set by the caller for the decode's span (null: no lookup)
     const std::vector<int32_t>* look_ctx_ = nullptr;

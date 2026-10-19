@@ -1723,10 +1723,16 @@ static int glm_pack_generate(const Options& o) {
             }
         }
     };
+    // STRATA_GLM_ABLATE_TOKENS=N: the refusal vector steers the prompt and the answer's first N tokens only
+    static const int64_t abl_tokens = [] {
+        const char* e = getenv("STRATA_GLM_ABLATE_TOKENS");
+        return e != nullptr ? std::max<int64_t>(0, std::atoll(e)) : 0;
+    }();
     const auto run_request = [&](const std::vector<int64_t>& ids, int64_t max_new,
                                  const strata::kernels::SamplerParams& rq_in) -> int {
         strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
         stop_req.store(false);
+        strata::core::Glm5Model::ablate_live(true);   // (STRATA_GLM_ABLATE_TOKENS: live again for this request)
         pause_req.store(false);
         pause_keep.store(false);
         model.force_next(-1);
@@ -1779,6 +1785,7 @@ static int glm_pack_generate(const Options& o) {
         const auto on_token = [&](int tok) -> bool {
             std::printf("T %d\n", tok);
             ++produced;
+            if (abl_tokens > 0 && produced == abl_tokens) strata::core::Glm5Model::ablate_live(false);
             emitted.push_back((int32_t) tok);
             strata::core::progress_at("decode: after token", produced);   // the watchdog's heartbeat (issue #40)
             strata::core::progress_beat();

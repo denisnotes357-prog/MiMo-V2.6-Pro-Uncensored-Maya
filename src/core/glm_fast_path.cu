@@ -6993,4 +6993,6 @@ bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<flo
     return true;
 }
 
+void Glm5Model::ablate_live(bool on) { glm_ablate::live().store(on, std::memory_order_relaxed); }
+
 }  // namespace strata::core

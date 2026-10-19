@@ -69,7 +69,8 @@ tower loaded, no CUDA) forks one encoder per picture: ~1.6 s from request to fea
 
 `STRATA_GLM_ABLATE=<file>`, `STRATA_GLM_ABLATE_LAYERS=70`, `STRATA_GLM_ABLATE_SCALE=s`: after every layer the residual
 stream loses `s` times its projection onto that layer's directions (`src/core/glm_ablate.cuh`; for MiMo 6 directions a
-layer, `70 × 6 × 6144` float32).
+layer, `70 × 6 × 6144` float32). `STRATA_GLM_ABLATE_TOKENS=N` keeps it on for the prompt and the answer's first N tokens
+only (`glm_ablate::live`, switched from `generate.cpp`).
 
 ## Switches for A/B tests
 

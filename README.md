@@ -14,7 +14,7 @@ Measured on 5× RTX 4090 48 GB + 2× A100 40 GB (320 GB VRAM), 503 GB RAM; 400-t
 
 | | **MiMo-V2.6-Pro Uncensored (this repo)** |
 | --- | ---: |
-| Refusals on 40 JailbreakBench requests (judge: the same quant without the vector) | **1 / 40** (24 / 40 without the vector) |
+| Refusals on 40 JailbreakBench requests (judge: the same quant without the vector) | **5 / 40** (24 / 40 without the vector) |
 | Decode, Russian / code, temperature 0 | **55–58 / 71–75 tok/s** |
 | Decode, Russian / code, temperature 1 | **53–55 / 64–75 tok/s** |
 | Decode when the answer repeats the context (code edits, proofreading) | **106–116 tok/s** |
@@ -99,7 +99,7 @@ The shipped config is for 7 GPUs with ~320 GB of VRAM (GPU 1 of that machine lef
 | `STRATA_GLM_SPEC_SAMPLE=1`, `STRATA_GLM_LOOKUP=1` | speculative sampling of drafts; prompt-lookup drafts |
 | `STRATA_GLM_CPU_LANE=0`, `STRATA_GLM_PREFILL_CPU=0` | no experts on the CPU — faster here and (nearly) deterministic |
 | `STRATA_MIMO_KV8=1` | INT8 KV cache for the 10 full-attention layers |
-| `STRATA_GLM_ABLATE_SCALE=0.35` | strength of the refusal vector (1.0 overshoots and damages Russian) |
+| `STRATA_GLM_ABLATE_SCALE=0.35`, `STRATA_GLM_ABLATE_TOKENS=64` | strength of the refusal vector, and how many answer tokens it steers (see below) |
 | `vision.gpu: true` | the vision tower on the first GPU (5.7 GB lent by the engine per picture) |
 | `STRATA_MIMO_DEV=1` | the `mimo2` path is marked experimental; the engine refuses it without this |
 
@@ -108,7 +108,7 @@ With less VRAM, Maya's tiers still work: experts that do not fit are served from
 ## How the uncensoring works
 
 1. **The base** is [`pqhaz/MiMo-V2.6-Pro-MOPD-heretic`](https://huggingface.co/pqhaz/MiMo-V2.6-Pro-MOPD-heretic) (MIT): Xiaomi's MiMo-V2.6-Pro-MOPD with a two-stage directional ablation in its attention output projections. Through our quant it still refused 24 of 40 JailbreakBench requests.
-2. **Runtime refusal vector.** Six refusal directions per layer were measured from the residual stream on harmful vs harmless instructions (`tools/mimo/capture.py`, `derive.py`) and are projected out after every layer while generating. Strength 0.35 brings refusals to **1 / 40**, leaves harmless prompts untouched and keeps Russian usable (perplexity 5.1 vs 4.0 without the vector); strength 1.0 — the usual choice — pushed Russian perplexity to 9.7.
+2. **Runtime refusal vector.** Six refusal directions per layer were measured from the residual stream on harmful vs harmless instructions (`tools/mimo/capture.py`, `derive.py`) and are projected out after every layer while generating. Strength 0.35 brings refusals to 1 / 40 and keeps short answers clean, but steering **every** token of a long answer piles up damage: 1000+-token Russian texts started to loop and coin words. So the vector steers only the prompt and the first 64 tokens of the answer (`STRATA_GLM_ABLATE_TOKENS=64`) — a refusal is decided at the start. Result: **5 / 40** refusals and clean long texts (0 of 4 long stories degraded, against 2–3 of 4 with the vector on every token).
 
 The quant itself is calibrated with ~14 % Russian text: an earlier quant calibrated on English only had a Russian perplexity of 44.8. Details, numbers and dead ends: [docs/HOW-IT-WAS-MADE.md](docs/HOW-IT-WAS-MADE.md).
 

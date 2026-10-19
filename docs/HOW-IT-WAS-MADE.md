@@ -58,6 +58,13 @@ vector). Six refusal directions per layer were measured from the residual stream
 
 Strength 1.0, the usual default, was 3–4× too strong for this model. Harmless prompts were untouched at every strength.
 
+**Long answers.** These numbers come from short answers. A book-writing test showed what they miss: with the vector on
+every token, 1000+-token Russian answers at temperature 1 started to loop ("Яма. Яма. Яма.") and coin words in 2–3 of
+4 stories — at strength 0.35, and still at 0.2 or with the vector on layers 30–60 only; plain decoding without drafts did
+the same, without the vector nothing broke. A refusal is decided at the start of an answer, so the vector now steers the
+prompt and the first 64 answer tokens only (`STRATA_GLM_ABLATE_TOKENS`): 0 of 4 stories degraded, 5 / 40 refusals
+(256 tokens: 1 of 4 degraded, 4 / 40).
+
 ## 4. The engine port
 
 `mimo2` lives inside Maya's `Glm5Model` behind an architecture flag (`STRATA_MIMO_DEV=1`): a geometry loader, a slow
