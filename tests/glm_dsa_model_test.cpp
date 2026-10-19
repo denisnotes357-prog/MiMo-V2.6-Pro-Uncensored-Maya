@@ -83,7 +83,9 @@ int main(int argc, char** argv) {
     std::string save, compare;
     bool need_top1 = true;
     int prefill_n = 0;
+    std::string mtp_ref;   // --mtp-ref DIR: mtp_top1.npy (int32 [T-1]) - after step(t) the draft mtp_draft(t+1) must equal it
     for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--mtp-ref") == 0 && i + 1 < argc) { mtp_ref = argv[++i]; continue; }
         if (std::strcmp(argv[i], "--tol") == 0 && i + 1 < argc) tol = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--cmin") == 0 && i + 1 < argc) cmin = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--save") == 0 && i + 1 < argc) save = argv[++i];
@@ -116,7 +118,8 @@ int main(int argc, char** argv) {
         std::fclose(f);
     }
     std::vector<float> all;
-    if (m.geometry().arch != strata::core::Glm5Geometry::Glm5Arch::Dsa) die("the GGUF is not glm-dsa");
+    if (m.geometry().arch != strata::core::Glm5Geometry::Glm5Arch::Dsa &&
+        m.geometry().arch != strata::core::Glm5Geometry::Glm5Arch::Mimo2) die("the GGUF is not glm-dsa or mimo2");
     if ((size_t) m.geometry().n_vocab != V) die("vocab mismatch");
 
     double worst = 0.0, worst_ref = 0.0, cworst = 0.0;
@@ -126,12 +129,26 @@ int main(int argc, char** argv) {
     size_t t_first = 0;
     if (prefill_n > 0) {
         const std::vector<int32_t> head(tokens.begin(), tokens.begin() + std::min<size_t>((size_t) prefill_n, T));
-        if (!m.prefill_run(head, err)) die("prefill: " + (err.empty() ? std::string("no prompt path") : err));
+        if (!m.prefill(head, err, head.size() < T ? tokens[head.size()] : -1)) die("prefill: " + (err.empty() ? std::string("no prompt path") : err));
         t_first = head.size();
         std::printf("glm_dsa_model_test: %zu tokens through the prompt path\n", t_first);
     }
+    std::vector<int32_t> mtp_top1;
+    size_t mtp_hit = 0, mtp_n = 0;
+    if (!mtp_ref.empty()) {
+        std::vector<size_t> ms;
+        mtp_top1 = load_npy<int32_t>(mtp_ref + "/mtp_top1.npy", "<i4", ms);
+        if (!m.mtp_ready()) die("--mtp-ref: the model has no one-GPU MTP decode (STRATA_GLM_MTP_DECODE=1, a pack with blk.<n>)");
+    }
     for (size_t t = t_first; t < T; ++t) {
         if (!m.forward({tokens[t]}, lg, err)) die("forward at " + std::to_string(t) + ": " + err);
+        if (!mtp_top1.empty() && t + 1 < T && t < mtp_top1.size()) {
+            const int d = m.mtp_draft(tokens[t + 1], err);
+            if (d < 0) die("mtp_draft at " + std::to_string(t) + ": " + err);
+            ++mtp_n;
+            mtp_hit += d == mtp_top1[t];
+            if (t < 6 || t % 16 == 0) std::printf("  mtp t=%2zu draft %5d ref %5d %s\n", t, d, mtp_top1[t], d == mtp_top1[t] ? "ok" : "--");
+        }
         const float* r = ref.data() + t * V;
         double d = 0.0, rmax = 0.0;
         size_t am = 0, ar = 0;
@@ -170,6 +187,9 @@ int main(int argc, char** argv) {
         if (t < 3 || t == 15 || t == 16 || t + 1 == T)
             std::printf("t=%3zu  max|d| %.3e  (max|ref| %.3f)  argmax %zu / ref %zu\n", t, d, rmax, am, ar);
     }
+    if (mtp_n > 0)
+        std::printf("glm_dsa_model_test: mtp drafts = reference on %zu of %zu (%.1f%%)\n", mtp_hit, mtp_n,
+                    100.0 * (double) mtp_hit / (double) mtp_n);
     std::printf("glm_dsa_model_test: %zu positions, worst max|d| %.3e at t=%zu (max|ref| %.3f), top-1 %zu/%zu, tol %.1e\n",
                 T - t_first, worst, worst_t, worst_ref, top1, T - t_first, tol);
     if (!save.empty()) {

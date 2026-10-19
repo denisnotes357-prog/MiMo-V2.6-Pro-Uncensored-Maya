@@ -274,6 +274,7 @@ struct Glm5Model::FastState {
     float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
     float *q = nullptr, *iq = nullptr, *score = nullptr;
     int* cells = nullptr;
+    float *qkv = nullptr, *attn = nullptr;   // mimo2: the fused q|k|v of one token, the attention output (float)
     void* sel_ws = nullptr;      // dsa_select's workspace (gf::kSelWsBytes): the several-block selection of a long context
     int dsa53_n_sel = 0;   // glm-dsa: the cells of the last full-indexer layer (this token's), which shared layers reuse
     int* slot_cells = nullptr;   // KV streaming: the selection in VRAM slot rows (glm_kv_resolve), what the attention reads
@@ -318,6 +319,11 @@ struct Glm5Model::FastState {
     int* tok = nullptr;
     // the NextN block (the half that carries it): its residual, eh_proj's q8_1 input, its logits and token
     float* mtp_h = nullptr;
+    float* mtp_h0 = nullptr;     // mimo2 non-chained drafts (STRATA_MIMO_MTP_NONCHAIN): the trunk's hidden state of step 0
+    float* mtp_hprev = nullptr;  // mimo2 native drafts (STRATA_MIMO_MTP3): the trunk's hidden state one position back
+    float* mtp_hrows = nullptr;  // ... the rows a round's cache fill reads (blocks 1 and 2: kPipeMax + 2 of n_embd each)
+    int* mtp_ftok = nullptr;     // ... the fill's token ids on the device (3 blocks x kPipeMax) and their pinned staging
+    int* mtp_ftok_h = nullptr;
     void* mtp_catq = nullptr;
     float* mtp_logits = nullptr;
     int* mtp_tok = nullptr;
@@ -367,6 +373,7 @@ struct Glm5Model::FastState {
         const float *hc_attn_scale = nullptr, *hc_attn_base = nullptr, *hc_ffn_scale = nullptr, *hc_ffn_base = nullptr;
         const float *attn_norm = nullptr, *ffn_norm = nullptr;
         WSlot q, k, v, out;
+        const float* sinks = nullptr;   // mimo2: the SWA layer's per-head sink logits (q = the fused attn_qkv)
         const uint16_t *f_a = nullptr, *g_a = nullptr, *f_b = nullptr, *g_b = nullptr, *beta = nullptr;
         const float *conv[3] = {nullptr, nullptr, nullptr};
         const float *dt_bias = nullptr, *ssm_a = nullptr, *ssm_norm = nullptr;
@@ -538,6 +545,7 @@ struct Glm5Model::FastState {
         float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
         float *q = nullptr, *iq = nullptr;
         float *q_abs = nullptr, *ctx = nullptr;   // the absorbed MLA's per-token rows (n_head x kv_lora each)
+        float *qkv = nullptr, *attn = nullptr;   // mimo2: the fused q|k|v rows, the attention output rows (float)
         void *qr_q = nullptr, *attn_q = nullptr;
         float *rlog = nullptr, *sh_g = nullptr, *sh_u = nullptr, *dg = nullptr, *du = nullptr;
         void* dhq = nullptr;

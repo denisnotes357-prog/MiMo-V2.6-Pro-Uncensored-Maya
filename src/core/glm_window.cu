@@ -158,7 +158,12 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
                         2 * al(T * 8 * 8) + 2 * al(T * 8 * f4) + al(T * E * f4) + al(T * f4) +
                         al(T * ((size_t) FF / 32 * q8)) + al(T * E * f4) + al(T * 8 * ((size_t) g.n_ff_exp / 32 * q8)) +
                         al(T * 8 * E * f4) + al(T * 8 * 8) + 3 * al((T * 8 + 1) * f4) + al(64) + al(T * 64) +
-                        (exl3_ ? al(T * 8 * (size_t) g.n_ff_exp * f4) : 0);
+                        (exl3_ ? al(T * 8 * (size_t) g.n_ff_exp * f4) : 0) +
+                        // mimo2: the fused q|k|v rows and the attention output rows
+                        (g.arch == Glm5Geometry::Glm5Arch::Mimo2
+                             ? al(T * (size_t) ((int64_t) g.n_head * g.head_k + g.kv_row_k() + g.kv_row_v()) * f4) +
+                                   al(T * (size_t) g.n_head * g.head_v * f4)
+                             : 0);
     if (cudaMalloc(&W.arena, need) != cudaSuccess) {
         cudaGetLastError();
         W.arena = nullptr;
@@ -198,6 +203,10 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
     W.emb = take_f(at, T * E);
     W.kin = n_kda > 0 ? take_f(at, (size_t) n_kda * W.kin_layer) : nullptr;
     W.q_abs = take_f(at, T * (size_t) g.n_head * g.kv_lora);
+    if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+        W.qkv = take_f(at, T * (size_t) ((int64_t) g.n_head * g.head_k + g.kv_row_k() + g.kv_row_v()));
+        W.attn = take_f(at, T * (size_t) g.n_head * g.head_v);
+    }
     W.ctx = take_f(at, T * (size_t) g.n_head * g.kv_lora);
     W.mplan_ptr = (unsigned long long*) take_b(at, T * 8 * 8);
     W.mfetch = (unsigned long long*) take_b(at, T * 8 * 8);
@@ -337,6 +346,7 @@ void Glm5Model::win_free() {
 
 // tokens t0 .. t0 + T - 1 of the window (a staggered window's group; all of it: t0 0)
 bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& err) {
+    if (g_.arch == Glm5Geometry::Glm5Arch::Mimo2) return fast_mimo2_window(il, p0, t0, T, err);
     FastState* F = fast_;
     auto& W = F->win;
     const Glm5Geometry& g = g_;

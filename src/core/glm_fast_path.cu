@@ -15,11 +15,15 @@
 // Victims come only from the requesting layer's own slot partition, so no kernel can be reading a
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
+#include <cuda_fp16.h>
 #include "glm_fast_state.hpp"
 #include "glm_ablate.cuh"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/mimo_decode_attn.hpp"
+#include "strata/kernels/mimo_prefill.hpp"
+#include "../kernels/cuda/mimo_kv8.cuh"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
@@ -642,11 +646,12 @@ bool Glm5Model::fast_setup(std::string& err) {
     }
 
     // ---- the weights, resolved once
-    const int NL = g.n_layers + 1;   // every per-layer table: the trunk + the NextN block's slot
+    // every per-layer table: the trunk + the NextN block's slot (+ mimo2's native MTP blocks 1 .. mtp_more_)
+    const int NL = g.n_layers + 1 + mtp_more_;
     F->L.assign((size_t) NL, FastState::Layer{});
     std::string missing;
-    for (int il = l0_; il < lt_; ++il) {
-        const bool is_mtp = il == mtp_il_;
+    for (int il = l0_; il < lt_ + (mtp_il_ >= 0 ? mtp_more_ : 0); ++il) {
+        const bool is_mtp = mtp_il_ >= 0 && il >= mtp_il_;
         auto& Ly = F->L[(size_t) il];
         const std::string P = "blk." + std::to_string(il) + ".";
         const auto f32 = [&](const char* n) -> const float* {
@@ -678,14 +683,15 @@ bool Glm5Model::fast_setup(std::string& err) {
             return q(n);
         };
         Ly.recr = is_mtp ? false : g.is_recr(il);
-        Ly.moe = il >= g.dense_lead;
+        Ly.moe = il >= g.dense_lead && !(is_mtp && g.arch == Glm5Geometry::Glm5Arch::Mimo2);   // (mimo2's MTP: dense)
         Ly.mtp = is_mtp;
         if (is_mtp) {
             // no hyper-connections: eh_proj in, plain residuals, the shared head's norm out
             Ly.eh = q("nextn.eh_proj.weight");
             Ly.enorm = f32("nextn.enorm.weight");
             Ly.hnorm = f32("nextn.hnorm.weight");
-            Ly.shnorm = f32("nextn.shared_head_norm.weight");
+            Ly.shnorm = f32(g.arch == Glm5Geometry::Glm5Arch::Mimo2 ? "layer_output_norm.weight"
+                                                                    : "nextn.shared_head_norm.weight");
         } else if (g.mhc) {
             Ly.hc_attn_fn = b16("hc_attn_fn.weight");
             Ly.hc_ffn_fn = b16("hc_ffn_fn.weight");
@@ -711,6 +717,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.dt_bias = f32("ssm_dt.bias");
             Ly.ssm_a = f32("ssm_a");
             Ly.ssm_norm = f32("ssm_norm.weight");
+        } else if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+            // mimo2: one fused q|k|v projection; the SWA layers' sink logits (the MTP blocks are SWA too)
+            Ly.q = q("attn_qkv.weight");
+            if (is_mtp || g.is_swa(il)) Ly.sinks = f32("attn_sinks.weight");
         } else if (g.arch == Glm5Geometry::Glm5Arch::Dsa) {
             // glm-dsa: kv_a gives the latent AND the k_rope tail; the indexer weights only where the layer runs its own
             // indexer (a full layer, or the NextN block) - no k-pool compressor at all
@@ -756,9 +766,11 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (Ly.moe) {
             Ly.router = b16("ffn_gate_inp.weight");
             Ly.router_bias = f32("exp_probs_b.bias");
-            Ly.sh_gate = q("ffn_gate_shexp.weight");
-            Ly.sh_up = q("ffn_up_shexp.weight");
-            Ly.sh_down = q("ffn_down_shexp.weight");
+            if (g.n_shared > 0) {   // (mimo2 has no shared expert: the MoE kernels take a null sh_down)
+                Ly.sh_gate = q("ffn_gate_shexp.weight");
+                Ly.sh_up = q("ffn_up_shexp.weight");
+                Ly.sh_down = q("ffn_down_shexp.weight");
+            }
             const auto& nl = pack_layers_[(size_t) il];
             if (nl.layer < 0) {
                 missing += P + "native experts ";
@@ -819,6 +831,10 @@ bool Glm5Model::fast_setup(std::string& err) {
         need += (size_t) gf::kAhead * g.n_expert * sizeof(float) + 256 + (size_t) E * sizeof(float) + 256;
         need += (size_t) g.n_sel_max() * sizeof(int) + 256;   // slot_cells
         need += gf::kSelWsBytes + 256;                        // sel_ws
+        if (g.arch == Glm5Geometry::Glm5Arch::Mimo2)   // qkv + attn (float) + attn_q (q8_1 of n_head * head_v)
+            need += (size_t) ((int64_t) g.n_head * g.head_k + g.kv_row_k() + g.kv_row_v() +
+                              (int64_t) g.n_head * g.head_v) * sizeof(float) +
+                    (size_t) g.n_head * g.head_v / 32 * q8 + 1024;
     }
     if (cudaMalloc(&F->arena, need) != cudaSuccess) {
         err = "glm fast: the activation arena did not allocate";
@@ -857,7 +873,12 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->cells = (int*) fa_take(at, (size_t) g.n_sel_max());
     F->slot_cells = (int*) fa_take(at, (size_t) g.n_sel_max());
     F->sel_ws = fa_take_b(at, gf::kSelWsBytes);
-    F->attn_q = fa_take_b(at, (size_t) g.n_head * g.v_head / 32 * q8);
+    F->attn_q = fa_take_b(at, (size_t) g.n_head *
+                                  (g.arch == Glm5Geometry::Glm5Arch::Mimo2 ? std::max(g.v_head, g.head_v) : g.v_head) / 32 * q8);
+    if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+        F->qkv = fa_take(at, (size_t) ((int64_t) g.n_head * g.head_k + g.kv_row_k() + g.kv_row_v()));
+        F->attn = fa_take(at, (size_t) g.n_head * g.head_v);
+    }
     F->rlog = fa_take(at, g.n_expert);
     F->plog = fa_take(at, g.n_expert);
     F->alog = fa_take(at, (size_t) gf::kAhead * g.n_expert);
@@ -897,6 +918,11 @@ bool Glm5Model::fast_setup(std::string& err) {
     }
     if (mtp_il_ >= 0) {
         if (cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&F->mtp_h0, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&F->mtp_hprev, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&F->mtp_hrows, (size_t) 2 * (kPipeMax + 2) * g.n_embd * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&F->mtp_ftok, (size_t) 3 * kPipeMax * sizeof(int)) != cudaSuccess ||
+            cudaHostAlloc((void**) &F->mtp_ftok_h, (size_t) 3 * kPipeMax * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
             cudaMalloc(&F->mtp_catq, (size_t) 2 * g.n_embd / 32 * 36) != cudaSuccess ||
             cudaMalloc(&F->mtp_logits, (size_t) g.n_vocab * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&F->mtp_tok, 64) != cudaSuccess ||
@@ -1550,7 +1576,9 @@ bool Glm5Model::fast_setup(std::string& err) {
             err = "glm fast: the table update buffers did not allocate";
             return false;
         }
-        F->stage.assign((size_t) g.n_exp_used, nullptr);
+        // one per routed expert of a token, and at least the 8 a fast_warm batch streams at once (a top-2 model's two
+        // buffers made the warm-up write past them - the mimo2 tiny fixture)
+        F->stage.assign((size_t) std::max(g.n_exp_used, 8), nullptr);
         for (auto& sbuf : F->stage)
             if (cudaHostAlloc((void**) &sbuf, sstride, cudaHostAllocPortable) != cudaSuccess) {
                 err = "glm fast: pinned disk staging did not allocate";
@@ -3317,6 +3345,11 @@ void Glm5Model::fast_destroy() {
                          100.0 * e.first / tot);
     }
     for (auto e : F->pev) cudaEventDestroy(e);
+    if (mimo_dec_scr_) {
+        cudaFree(mimo_dec_scr_);
+        mimo_dec_scr_ = nullptr;
+        mimo_dec_cap_ = 0;
+    }
     if (snap_pool_) {
         cudaFree(snap_pool_);
         snap_pool_ = nullptr;
@@ -3365,6 +3398,11 @@ void Glm5Model::fast_destroy() {
     if (F->tok_h) cudaFreeHost(F->tok_h);
     if (F->scratch) cudaFree(F->scratch);
     if (F->mtp_h) cudaFree(F->mtp_h);
+    if (F->mtp_h0) cudaFree(F->mtp_h0);
+    if (F->mtp_hprev) cudaFree(F->mtp_hprev);
+    if (F->mtp_hrows) cudaFree(F->mtp_hrows);
+    if (F->mtp_ftok) cudaFree(F->mtp_ftok);
+    if (F->mtp_ftok_h) cudaFreeHost(F->mtp_ftok_h);
     if (F->mtp_catq) cudaFree(F->mtp_catq);
     if (F->mtp_logits) cudaFree(F->mtp_logits);
     if (F->mtp_tok) cudaFree(F->mtp_tok);
@@ -4674,6 +4712,7 @@ static void fast_dump(cudaStream_t s, const std::string& name, const float* dev,
 // ---- one DSA (MLA + indexer) mixer: F->x / F->xq -> F->mixer at position p (the trunk's DSA layers and the NextN block)
 bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     if (g_.arch == Glm5Geometry::Glm5Arch::Dsa) return fast_dsa53(il, p, err);
+    if (g_.arch == Glm5Geometry::Glm5Arch::Mimo2) return fast_mimo2(il, p, err);
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -4753,6 +4792,317 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
 // glm-dsa's DSA mixer for one token (docs/GLM53-ENGINE-PORT.md P3; step_layers_dsa is its reference): the projections,
 // the cache row [latent | rotated k_rope] and (full layers) the rotated indexer key, q_b with its rope part rotated, the
 // indexer's top-k over every key so far (a shared layer reuses the last full layer's), the absorbed MLA, attn_output
+// ---- mimo2 (docs/MIMO2-ENGINE-PORT.md): the token path's GQA - correctness-first kernels on the compute stream
+// (the reference step's arithmetic: NeoX RoPE on the first rope_first dims, one block per q head over the F32 caches;
+// split-K over long contexts and FP16 caches / the SWA ring are the next steps, M4)
+namespace {
+__global__ void mimo_rope_neox(float* __restrict__ x, int n_vec, int stride, int n_rot, long long pos, float base) {
+    const int half = n_rot / 2;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_vec * half) return;
+    const int v = idx / half, i = idx % half;
+    const double theta = (double) pos * pow((double) base, -2.0 * i / n_rot);
+    const float c = (float) cos(theta), sn = (float) sin(theta);
+    float* q = x + (size_t) v * stride;
+    const float a = q[i], b = q[i + half];
+    q[i] = a * c - b * sn;
+    q[i + half] = b * c + a * sn;
+}
+
+constexpr int kMimoAttnThreads = 256;
+// K/V caches FP16, row = position % ring (ring = the cache's rows: max_ctx for a full layer, swa_ring for a SWA one)
+__global__ void mimo_kv_store(const float* __restrict__ k, const float* __restrict__ v, __half* __restrict__ kc,
+                              __half* __restrict__ vc, int row_k, int row_v, int row) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < row_k) kc[(size_t) row * row_k + i] = __float2half(k[i]);
+    if (i < row_v) vc[(size_t) row * row_v + i] = __float2half(v[i]);
+}
+
+__global__ void __launch_bounds__(kMimoAttnThreads)
+mimo_gqa_attention(const float* __restrict__ q, const __half* __restrict__ kc, const __half* __restrict__ vc, int ring,
+                   int n_head, int n_kv, int head_k, int head_v, int lo, int p, const float* __restrict__ sinks,
+                   float scale, float v_scale, float* __restrict__ out) {
+    extern __shared__ float sc[];
+    __shared__ float red[kMimoAttnThreads];
+    const int h = blockIdx.x;
+    const int kvh = h / (n_head / n_kv);
+    const int n_keys = p - lo + 1;
+    const float* qh = q + (size_t) h * head_k;
+    for (int j = threadIdx.x; j < n_keys; j += blockDim.x) {
+        const __half* kj = kc + ((size_t) ((lo + j) % ring) * n_kv + kvh) * head_k;
+        float acc = 0.0f;
+        for (int d = 0; d < head_k; ++d) acc += qh[d] * __half2float(kj[d]);
+        sc[j] = acc * scale;
+    }
+    __syncthreads();
+    float m = -INFINITY;
+    for (int j = threadIdx.x; j < n_keys; j += blockDim.x) m = fmaxf(m, sc[j]);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s2]);
+        __syncthreads();
+    }
+    const float sink = sinks != nullptr ? sinks[h] : -INFINITY;
+    m = fmaxf(red[0], sink);
+    __syncthreads();
+    float l = 0.0f;
+    for (int j = threadIdx.x; j < n_keys; j += blockDim.x) {
+        const float e = expf(sc[j] - m);
+        sc[j] = e;
+        l += e;
+    }
+    red[threadIdx.x] = l;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] += red[threadIdx.x + s2];
+        __syncthreads();
+    }
+    const float inv = v_scale / (red[0] + (sinks != nullptr ? expf(sink - m) : 0.0f));
+    for (int d = threadIdx.x; d < head_v; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < n_keys; ++j)
+            acc += sc[j] * __half2float(vc[((size_t) ((lo + j) % ring) * n_kv + kvh) * head_v + d]);
+        out[(size_t) h * head_v + d] = acc * inv;
+    }
+}
+
+// The same attention for any number of keys (no scores in shared memory): online softmax, one (row, head) per block of
+// kFlashWarps warps; warp w walks keys lo+w, lo+w+kFlashWarps, ...; a lane owns head_k/32 of q.k's terms and head_v/32
+// of the output dims (head_k, head_v multiples of 32, head_v <= 32 * kFlashVMax).  The warps' partial (max, sum, acc)
+// meet in shared memory with the sink logit.  q: rows x [n_head x head_k] (row stride q_ld), position p0 + row.
+constexpr int kFlashWarps = 8;
+constexpr int kFlashVMax = 8;   // head_v up to 256
+template<bool KV8>
+__global__ void __launch_bounds__(kFlashWarps * 32)
+mimo_attn_flash(const float* __restrict__ q, int q_ld, const __half* __restrict__ kc, const __half* __restrict__ vc, const float* ks, const float* vs,
+                int ring, int n_head, int n_kv, int head_k, int head_v, int window, int p0,
+                const float* __restrict__ sinks, float scale, float v_scale, float* __restrict__ out, int out_ld) {
+    const int h = blockIdx.x, row = blockIdx.y;
+    const int p = p0 + row;
+    const int lo = window > 0 ? max(0, p - window + 1) : 0;
+    const int kvh = h / (n_head / n_kv);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const float* qh = q + (size_t) row * q_ld + (size_t) h * head_k;
+    const int nk = head_k / 32, nv = head_v / 32;
+    float qr[8];
+    for (int i = 0; i < nk; ++i) qr[i] = qh[lane + 32 * i] * scale;
+    float m = -INFINITY, l = 0.0f, acc[kFlashVMax];
+    for (int i = 0; i < kFlashVMax; ++i) acc[i] = 0.0f;
+    for (int j = lo + warp; j <= p; j += kFlashWarps) {
+        const size_t r = (size_t) (j % ring) * n_kv + kvh;
+        const __half* kj = kc + r * head_k;
+        float sdot = 0.0f;
+        for (int i = 0; i < nk; ++i) sdot += qr[i] * strata::kernels::mimo_cache_load<KV8>(kc, ks, r, head_k, lane + 32 * i);
+        for (int o = 16; o > 0; o >>= 1) sdot += __shfl_xor_sync(0xffffffffu, sdot, o);
+        const float mn = fmaxf(m, sdot);
+        const float corr = expf(m - mn), e = expf(sdot - mn);
+        l = l * corr + e;
+        const __half* vj = vc + r * head_v;
+        for (int i = 0; i < nv; ++i) acc[i] = acc[i] * corr + e * strata::kernels::mimo_cache_load<KV8>(vc, vs, r, head_v, lane + 32 * i);
+        m = mn;
+    }
+    __shared__ float sm[kFlashWarps], sl[kFlashWarps];
+    __shared__ float sacc[kFlashWarps][32 * kFlashVMax];
+    if (lane == 0) { sm[warp] = m; sl[warp] = l; }
+    for (int i = 0; i < nv; ++i) sacc[warp][lane + 32 * i] = acc[i];
+    __syncthreads();
+    float M = sinks != nullptr ? sinks[h] : -INFINITY;
+    for (int w = 0; w < kFlashWarps; ++w) M = fmaxf(M, sm[w]);
+    float L = sinks != nullptr ? expf(sinks[h] - M) : 0.0f;
+    for (int w = 0; w < kFlashWarps; ++w) L += sm[w] == -INFINITY ? 0.0f : sl[w] * expf(sm[w] - M);
+    const float inv = v_scale / L;
+    for (int d = threadIdx.x; d < head_v; d += blockDim.x) {
+        float o = 0.0f;
+        for (int w = 0; w < kFlashWarps; ++w)
+            if (sm[w] != -INFINITY) o += sacc[w][d] * expf(sm[w] - M);
+        out[(size_t) row * out_ld + (size_t) h * head_v + d] = o * inv;
+    }
+}
+}  // namespace
+
+bool Glm5Model::mimo_dec_attn(int il, const float* q, int q_ld, const void* kc, const void* vc, int ring, int p0, int T,
+                              float* out, int out_ld, cudaStream_t s) {
+    static const bool off = getenv("STRATA_MIMO_DEC_OFF") != nullptr;
+    static const int min_keys = getenv("STRATA_MIMO_DEC_MIN") ? std::atoi(getenv("STRATA_MIMO_DEC_MIN")) : 256;
+    if (off || p0 + T < min_keys) return false;
+    const Glm5Geometry& g = g_;
+    strata::kernels::MimoDecAttnArgs a{g.n_head, g.n_head_kv_gqa, g.head_k, g.head_v, ring, 0, p0, T,
+                                      1.0f / std::sqrt((float) g.head_k), g.v_scale};
+    if (mimo_dec_scr_ == nullptr) {   // sized for the widest window (8 rows) at the most slices
+        strata::kernels::MimoDecAttnArgs w = a;
+        w.T = 8;
+        w.p0 = 1 << 30;
+        const size_t need = strata::kernels::mimo_decode_attn_scratch(w, strata::kernels::mimo_decode_attn_splits(w));
+        if (cudaMalloc(&mimo_dec_scr_, need * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            mimo_dec_scr_ = nullptr;
+            mimo_dec_cap_ = 0;
+            static bool warned = false;
+            if (!warned) std::fprintf(stderr, "glm fast: CUDA%d the mimo2 decode attention scratch (%.0f MB) does not fit - "
+                                              "the per-head kernel stays\n", dev_, need * 4.0 / 1048576.0);
+            warned = true;
+            return false;
+        }
+        mimo_dec_cap_ = need;
+    }
+    if (mimo_kv8_layer(il))
+        return strata::kernels::mimo_decode_attn_kv8(q,q_ld,(const int8_t*)kc,(const int8_t*)vc,
+            state_+dsa_ig_[(size_t)il],state_+dsa_pool_[(size_t)il],nullptr,out,out_ld,a,mimo_dec_scr_,mimo_dec_cap_,s);
+    return strata::kernels::mimo_decode_attn(q, q_ld, (const uint16_t*) kc, (const uint16_t*) vc, nullptr, out, out_ld, a,
+                                             mimo_dec_scr_, mimo_dec_cap_, s);
+}
+
+bool Glm5Model::fast_mimo2(int il, int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const bool swa = Ly.mtp || g.is_swa(il);
+    const int64_t q_size = (int64_t) g.n_head * g.head_k;
+    const int64_t n_qkv = q_size + g.kv_row_k() + g.kv_row_v();
+    if (p >= max_ctx_) {
+        err = "glm fast: mimo2 position " + std::to_string(p) + " past max_ctx " + std::to_string(max_ctx_);
+        return false;
+    }
+    gf::MvJob j = {Ly.q.q, F->xq, F->x, F->qkv, nullptr, 1.0f, Ly.q.type, g.n_embd, (int) n_qkv};
+    if (!gf::mv(&j, 1, s)) { err = "glm fast: mimo2 qkv"; return false; }
+    if (F->prof_on) F->mark("mimo_qkv_mv");
+    float* q = F->qkv;
+    float* k = q + q_size;
+    float* v = k + g.kv_row_k();
+    const float base = swa ? g.rope_base_swa : g.rope_base;
+    const int half = g.rope_first / 2;
+    mimo_rope_neox<<<(g.n_head * half + 255) / 256, 256, 0, s>>>(q, g.n_head, g.head_k, g.rope_first, (long long) p, base);
+    mimo_rope_neox<<<(g.n_head_kv_gqa * half + 255) / 256, 256, 0, s>>>(k, g.n_head_kv_gqa, g.head_k, g.rope_first,
+                                                                        (long long) p, base);
+    __half* kc = (__half*) (state_ + dsa_lat_[(size_t) il]);
+    __half* vc = (__half*) (state_ + dsa_ik_[(size_t) il]);
+    const int ring = swa ? (int) std::min<int64_t>(max_ctx_, g.swa_ring()) : (int) max_ctx_;   // (the MTP block too)
+    const int nmax = std::max(g.kv_row_k(), g.kv_row_v());
+    if (mimo_kv8_layer(il))
+            strata::kernels::mimo_kv8_store(k,g.kv_row_k(),v,g.kv_row_v(),(int8_t*)kc,(int8_t*)vc,
+                state_+dsa_ig_[(size_t)il],state_+dsa_pool_[(size_t)il],(int)p,1,ring,g.n_head_kv_gqa,g.head_k,g.head_v,s);
+        else mimo_kv_store<<<(nmax + 255) / 256, 256, 0, s>>>(k, v, kc, vc, g.kv_row_k(), g.kv_row_v(), (int) (p % ring));
+    if (g.head_k % 32 != 0 || g.head_k > 256 || g.head_v % 32 != 0 || g.head_v > 32 * kFlashVMax) {
+        err = "glm fast: mimo2 head dims " + std::to_string(g.head_k) + "/" + std::to_string(g.head_v) +
+              " are not covered by the attention kernel";
+        return false;
+    }
+    if (getenv("STRATA_MIMO_ATTN_SMEM") != nullptr) {   // (the first kernel, kept for A/B: keys in shared memory)
+        const int lo = swa ? (int) std::max<int64_t>(0, p - g.swa_window + 1) : 0;
+        const size_t smem = (size_t) ((int) p - lo + 1) * sizeof(float);
+        if (smem > 48 * 1024) {
+            err = "glm fast: STRATA_MIMO_ATTN_SMEM over " + std::to_string(p - lo + 1) + " keys";
+            return false;
+        }
+        mimo_gqa_attention<<<g.n_head, kMimoAttnThreads, smem, s>>>(q, kc, vc, ring, g.n_head, g.n_head_kv_gqa, g.head_k,
+                                                                   g.head_v, lo, (int) p, swa ? Ly.sinks : nullptr,
+                                                                   1.0f / std::sqrt((float) g.head_k), g.v_scale, F->attn);
+    } else if (swa || !mimo_dec_attn(il, q, (int) n_qkv, kc, vc, ring, (int) p, 1, F->attn, g.n_head * g.head_v, s)) {
+        if (mimo_kv8_layer(il))
+            mimo_attn_flash<true><<<dim3(g.n_head,1),kFlashWarps*32,0,s>>>(q,(int)n_qkv,kc,vc,
+                state_+dsa_ig_[(size_t)il],state_+dsa_pool_[(size_t)il],ring,g.n_head,g.n_head_kv_gqa,g.head_k,g.head_v,
+                0,(int)p,nullptr,1.0f/std::sqrt((float)g.head_k),g.v_scale,F->attn,g.n_head*g.head_v);
+        else
+        mimo_attn_flash<false><<<dim3(g.n_head, 1), kFlashWarps * 32, 0, s>>>(
+            q, (int) n_qkv, kc, vc, nullptr, nullptr, ring, g.n_head, g.n_head_kv_gqa, g.head_k, g.head_v, swa ? g.swa_window : 0, (int) p,
+            swa ? Ly.sinks : nullptr, 1.0f / std::sqrt((float) g.head_k), g.v_scale, F->attn, g.n_head * g.head_v);
+    }
+    gf::quantize_q8_1(F->attn, F->attn_q, g.n_head * g.head_v, s);
+    if (F->prof_on) F->mark("mimo_attn");
+    gf::MvJob o = {Ly.out.q, F->attn_q, F->attn, F->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.head_v, g.n_embd};
+    if (!gf::mv(&o, 1, s)) { err = "glm fast: mimo2 output"; return false; }
+    if (F->prof_on) F->mark("mimo_out_mv");
+    return true;
+}
+
+// mimo2 in the verify WINDOW (glm_window.cu): rows t0 .. t0+T-1 at positions p0 + t - every row's K/V first (a row reads
+// the window rows before it), then the flash kernel over the T rows at once, the q8_1 of each row into the output mv
+bool Glm5Model::fast_mimo2_window(int il, int64_t p0, int t0, int T, std::string& err) {
+    FastState* F = fast_;
+    auto& W = F->win;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const int E = g.n_embd;
+    const bool swa = Ly.mtp || g.is_swa(il);
+    const int64_t q_size = (int64_t) g.n_head * g.head_k;
+    const int64_t n_qkv = q_size + g.kv_row_k() + g.kv_row_v();
+    const int AO = g.n_head * g.head_v;
+    if (W.qkv == nullptr || W.attn == nullptr) { err = "glm window: no mimo2 rows"; return false; }
+    if (p0 + t0 + T > max_ctx_) { err = "glm window: mimo2 rows past max_ctx"; return false; }
+    gf::MvJob j = {Ly.q.q, (const uint8_t*) W.xq + (size_t) t0 * W.xq_s, W.x + (size_t) t0 * E,
+                   W.qkv + (size_t) t0 * n_qkv, nullptr, 1.0f, Ly.q.type, E, (int) n_qkv};
+    j.ncol = T;
+    j.xq_cstride = (int64_t) W.xq_s;
+    j.xf_cstride = E;
+    j.y_cstride = n_qkv;
+    if (!gf::mv(&j, 1, s)) { err = "glm window: mimo2 qkv"; return false; }
+    const float base = swa ? g.rope_base_swa : g.rope_base;
+    const int half = g.rope_first / 2;
+    __half* kc = (__half*) (state_ + dsa_lat_[(size_t) il]);
+    __half* vc = (__half*) (state_ + dsa_ik_[(size_t) il]);
+    const int ring = swa ? (int) std::min<int64_t>(max_ctx_, g.swa_ring()) : (int) max_ctx_;
+    const int nmax = std::max(g.kv_row_k(), g.kv_row_v());
+    for (int t = t0; t < t0 + T; ++t) {
+        float* q = W.qkv + (size_t) t * n_qkv;
+        float* k = q + q_size;
+        float* v = k + g.kv_row_k();
+        const long long pos = (long long) (p0 + t);
+        mimo_rope_neox<<<(g.n_head * half + 255) / 256, 256, 0, s>>>(q, g.n_head, g.head_k, g.rope_first, pos, base);
+        mimo_rope_neox<<<(g.n_head_kv_gqa * half + 255) / 256, 256, 0, s>>>(k, g.n_head_kv_gqa, g.head_k, g.rope_first, pos,
+                                                                            base);
+        if (mimo_kv8_layer(il))
+            strata::kernels::mimo_kv8_store(k,g.kv_row_k(),v,g.kv_row_v(),(int8_t*)kc,(int8_t*)vc,
+                state_+dsa_ig_[(size_t)il],state_+dsa_pool_[(size_t)il],(int)pos,1,ring,g.n_head_kv_gqa,g.head_k,g.head_v,s);
+        else mimo_kv_store<<<(nmax + 255) / 256, 256, 0, s>>>(k, v, kc, vc, g.kv_row_k(), g.kv_row_v(), (int) (pos % ring));
+    }
+    if (swa || !mimo_dec_attn(il, W.qkv + (size_t) t0 * n_qkv, (int) n_qkv, kc, vc, ring, (int) (p0 + t0), T,
+                              W.attn + (size_t) t0 * AO, AO, s)) {
+        if (mimo_kv8_layer(il))
+            mimo_attn_flash<true><<<dim3(g.n_head,T),kFlashWarps*32,0,s>>>(W.qkv+(size_t)t0*n_qkv,(int)n_qkv,kc,vc,
+                state_+dsa_ig_[(size_t)il],state_+dsa_pool_[(size_t)il],ring,g.n_head,g.n_head_kv_gqa,g.head_k,g.head_v,
+                0,(int)(p0+t0),nullptr,1.0f/std::sqrt((float)g.head_k),g.v_scale,W.attn+(size_t)t0*AO,AO);
+        else
+        mimo_attn_flash<false><<<dim3(g.n_head, T), kFlashWarps * 32, 0, s>>>(
+            W.qkv + (size_t) t0 * n_qkv, (int) n_qkv, kc, vc, nullptr, nullptr, ring, g.n_head, g.n_head_kv_gqa, g.head_k, g.head_v,
+            swa ? g.swa_window : 0, (int) (p0 + t0), swa ? Ly.sinks : nullptr, 1.0f / std::sqrt((float) g.head_k),
+            g.v_scale, W.attn + (size_t) t0 * AO, AO);
+    }
+    for (int t = t0; t < t0 + T; ++t)
+        gf::quantize_q8_1(W.attn + (size_t) t * AO, (uint8_t*) W.attn_q + (size_t) t * W.aq_s, AO, s);
+    gf::MvJob o = {Ly.out.q, (const uint8_t*) W.attn_q + (size_t) t0 * W.aq_s, W.attn + (size_t) t0 * AO,
+                   W.mixer + (size_t) t0 * E, nullptr, 1.0f, Ly.out.type, AO, E};
+    o.ncol = T;
+    o.xq_cstride = (int64_t) W.aq_s;
+    o.xf_cstride = AO;
+    o.y_cstride = E;
+    if (!gf::mv(&o, 1, s)) { err = "glm window: mimo2 output"; return false; }
+    return true;
+}
+
+// mimo2's MTP cache row at position p (mtp_cache_rows): the fused projection of the block's normed input is in qkv (its
+// q part unused); k gets the SWA layer's RoPE, then k and v go to the block's ring as fast_mimo2 stores them
+bool Glm5Model::mimo_mtp_kv_row(float* qkv, int64_t p, std::string& err, int il) {
+    if (il < 0) il = mtp_il_;
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    float* k = qkv + (int64_t) g.n_head * g.head_k;
+    float* v = k + g.kv_row_k();
+    const int half = g.rope_first / 2;
+    mimo_rope_neox<<<(g.n_head_kv_gqa * half + 255) / 256, 256, 0, s>>>(k, g.n_head_kv_gqa, g.head_k, g.rope_first,
+                                                                        (long long) p, g.rope_base_swa);
+    const int ring = (int) std::min<int64_t>(max_ctx_, g.swa_ring());
+    const int nmax = std::max(g.kv_row_k(), g.kv_row_v());
+    mimo_kv_store<<<(nmax + 255) / 256, 256, 0, s>>>(k, v, (__half*) (state_ + dsa_lat_[(size_t) il]),
+                                                    (__half*) (state_ + dsa_ik_[(size_t) il]), g.kv_row_k(),
+                                                    g.kv_row_v(), (int) (p % ring));
+    (void) err;
+    return true;
+}
+
 bool Glm5Model::fast_dsa53(int il, int64_t p, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -5337,8 +5687,9 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
-    const int il = mtp_il_;
-    if (F == nullptr || il < 0) {
+    // a native round (STRATA_MIMO_MTP3): step k runs block k (blk.<n_layers + k>), fed the trunk's hidden state
+    const int il = mtp_il_ + (mtp_native_ ? std::min(step, mtp_more_) : 0);
+    if (F == nullptr || mtp_il_ < 0) {
         err = "glm mtp: no draft block on this half";
         return false;
     }
@@ -5373,7 +5724,27 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
             cudaMemcpyAsync(F->emb, F->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
         }
     }
-    gf::mtp_in(F->emb, F->head_x, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
+    // mimo2's MTP blocks were trained non-chained: every depth reads the TRUNK's hidden state of the last verified
+    // position (tools/mimo/mtp3_ref.py: layer 0 fed its own output at depth 2/3 is right 16/3 % of the time, fed the
+    // trunk's 44/31 %).  STRATA_MIMO_MTP_NONCHAIN=1: step 0 keeps head_x (the trunk's) and the later steps read it.
+    static const bool nonchain = getenv("STRATA_MIMO_MTP_NONCHAIN") != nullptr;
+    const bool nc = (nonchain || mtp_native_) && g.arch == Glm5Geometry::Glm5Arch::Mimo2 && F->mtp_h0 != nullptr;
+    if (nc && step == 0) cudaMemcpyAsync(F->mtp_h0, F->head_x, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    if (mtp_native_ && step == 2 && mtp_prov_ok_ && F->mtp_emb != nullptr) {
+        // block 2's ring entry one position back wants the token two ahead of it: the first draft (device-side, so the
+        // drafts stay queued); the fill after the verify rewrites it with the real token
+        gf::embed_tok(F->mtp_emb, F->mtp_emb_type, (int) g.n_vocab, F->mtp_tok, E, F->emb, s);
+        gf::mtp_in(F->emb, F->mtp_hprev, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
+        gf::MvJob pe = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
+        if (!gf::mv(&pe, 1, s)) { err = "glm mtp: provisional eh_proj"; return false; }
+        gf::rms_q8(F->mtp_h, nullptr, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
+        const int n_qkv = g.n_head * g.head_k + g.kv_row_k() + g.kv_row_v();
+        gf::MvJob pq = {Ly.q.q, F->xq, F->x, F->qkv, nullptr, 1.0f, Ly.q.type, E, n_qkv};
+        if (!gf::mv(&pq, 1, s)) { err = "glm mtp: provisional qkv"; return false; }
+        if (!mimo_mtp_kv_row(F->qkv, p - 1, err, il)) return false;
+        gf::embed_tok(F->mtp_emb, F->mtp_emb_type, (int) g.n_vocab, F->mtp_tok + step - 1, E, F->emb, s);   // (back)
+    }
+    gf::mtp_in(F->emb, nc && step > 0 ? F->mtp_h0 : F->head_x, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
     gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
     if (!gf::mv(&eh, 1, s)) {
         err = "glm mtp: eh_proj";
@@ -5384,7 +5755,15 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     if (!fast_dsa(il, p, err)) return false;
     gf::rms_q8(F->mtp_h, F->mixer, Ly.ffn_norm, g.norm_eps, E, F->x, F->xq, s);
     bool pf_pending = false;
-    if (!fast_moe(il, pf_pending, err)) return false;
+    if (!Ly.moe) {   // mimo2's MTP block: a dense MLP (fast_layers' dense half)
+        gf::MvJob j[2];
+        j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, g.n_ff_dense};
+        j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, g.n_ff_dense};
+        if (!gf::mv(j, 2, s)) { err = "glm mtp: dense ffn"; return false; }
+        gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, g.n_ff_dense, F->dhq, s);
+        gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense, g.n_embd};
+        if (!gf::mv(&dn, 1, s)) { err = "glm mtp: dense ffn down"; return false; }
+    } else if (!fast_moe(il, pf_pending, err)) return false;
     gf::rms_q8(F->mtp_h, F->ffn, Ly.shnorm, g.norm_eps, E, F->head_x, F->head_xq, s);
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o[2];
@@ -5441,11 +5820,13 @@ int Glm5Model::fast_sample(strata::kernels::SamplerParams& sp, std::string& err)
 int Glm5Model::fast_sample_verify(strata::kernels::SamplerParams& sp, std::string& err) {
     FastState* F = fast_;
     cudaSetDevice(dev_);
-    if (F->spec_q == nullptr) {
+    // fast_mtp's step-0 destination: spec_qs once a pipelined request allocated it (a later decode_spec draws there)
+    const auto* sq = (const strata::kernels::SpecList*) (F->spec_qs != nullptr ? F->spec_qs : F->spec_q);
+    if (sq == nullptr) {
         err = "glm sampler (verify): no draft list";
         return -1;
     }
-    strata::kernels::sample_verify(sc_ + sc_logits, 1, (int) g_.n_vocab, sp, (const strata::kernels::SpecList*) F->spec_q,
+    strata::kernels::sample_verify(sc_ + sc_logits, 1, (int) g_.n_vocab, sp, sq,
                                    F->mtp_tok, d_tok_, F->cs);
     cudaMemcpyAsync(F->tok_h, d_tok_, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm sampler (verify)", err) || !F->route_ok(err)) return -1;
@@ -6127,6 +6508,10 @@ std::vector<int> Glm5Model::dsa_layers() const {
 // of kpool) <-> snap_pool_; on fast_->cs
 void Glm5Model::snap_pool_copy(bool restore) {
     const Glm5Geometry& g = g_;
+    if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {   // no indexer pool: the SWA rings are what later positions overwrite
+        snap_ring_copy(restore);
+        return;
+    }
     const std::vector<int> ls = dsa_layers();
     const int64_t rows = (int64_t) (g.idx_kpool - 1) * g.idx_key;   // floats per cache
     if (ls.empty() || rows <= 0 || snap_pos_ < 0) return;
@@ -6144,6 +6529,53 @@ void Glm5Model::snap_pool_copy(bool restore) {
             cudaMemcpyAsync(restore ? ring[c] : keep, restore ? keep : ring[c], (size_t) rows * sizeof(float),
                             cudaMemcpyDeviceToDevice, fast_->cs);
         }
+    }
+}
+
+// mimo2: the K/V ring of a SWA layer (swa_ring rows, position p at row p % ring; the MTP block attends the same way)
+// is overwritten by the positions after the snapshot, so the snapshot keeps every such ring of this half whole: the K
+// ring then the V ring of each layer, in swa_ring_layers() order, in snap_pool_ (~12 MB a part at ring 256).  A full
+// layer's cache holds every position, so restoring the position is enough for it, as for the DSA caches.
+std::vector<int> Glm5Model::swa_ring_layers() const {
+    std::vector<int> r;
+    if (mtp_il_ >= 0)
+        for (int k = 0; k <= mtp_more_; ++k) r.push_back(mtp_il_ + k);
+    for (int il = l0_; il < l1_; ++il)
+        if (g_.is_swa(il)) r.push_back(il);
+    return r;
+}
+
+size_t Glm5Model::snap_pool_floats() const {
+    const Glm5Geometry& g = g_;
+    if (g.arch != Glm5Geometry::Glm5Arch::Mimo2)
+        return dsa_layers().size() * 2 * (size_t) ((g.idx_kpool - 1) * g.idx_key);
+    const int64_t ring = std::min<int64_t>(max_ctx_, g.swa_ring());   // (glm_model.cu's mimo2 cache rows, FP16)
+    const size_t per = (size_t) (((int64_t) g.kv_row_k() * ring + 1) / 2 + ((int64_t) g.kv_row_v() * ring + 1) / 2);
+    return swa_ring_layers().size() * per;
+}
+
+void Glm5Model::snap_ring_copy(bool restore) {
+    const Glm5Geometry& g = g_;
+    const std::vector<int> ls = swa_ring_layers();
+    const size_t total = snap_pool_floats();
+    if (ls.empty() || total == 0 || snap_pos_ < 0) return;
+    if (snap_pool_ == nullptr && cudaMalloc(&snap_pool_, total * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        snap_pool_ = nullptr;
+        return;
+    }
+    const int64_t ring = std::min<int64_t>(max_ctx_, g.swa_ring());
+    const size_t kf = (size_t) (((int64_t) g.kv_row_k() * ring + 1) / 2);
+    const size_t vf = (size_t) (((int64_t) g.kv_row_v() * ring + 1) / 2);
+    size_t at = 0;
+    for (int il : ls) {
+        float* k = state_ + dsa_lat_[(size_t) il];
+        float* v = state_ + dsa_ik_[(size_t) il];
+        float* kk = snap_pool_ + at;
+        float* vk = snap_pool_ + at + kf;
+        cudaMemcpyAsync(restore ? k : kk, restore ? kk : k, kf * sizeof(float), cudaMemcpyDeviceToDevice, fast_->cs);
+        cudaMemcpyAsync(restore ? v : vk, restore ? vk : v, vf * sizeof(float), cudaMemcpyDeviceToDevice, fast_->cs);
+        at += kf + vf;
     }
 }
 
@@ -6209,6 +6641,25 @@ bool Glm5Model::snapshot_restore() {
 // the open pool's rows at `pos` (pool start .. + kpool - 2: contiguous in the ring) <-> host; on fast_->cs
 void Glm5Model::ckpt_pool_copy(int64_t pos, float* host, bool restore) {
     const Glm5Geometry& g = g_;
+    if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+        // mimo2: the state past the positional full-layer caches is the SWA rings (the trunk's and the MTP blocks'),
+        // whole, in snap_ring_copy's layout (K ring then V ring a layer) - ~80 MB a checkpoint over the 7 parts
+        (void) pos;
+        const int64_t ring = std::min<int64_t>(max_ctx_, g.swa_ring());
+        const size_t kf = (size_t) (((int64_t) g.kv_row_k() * ring + 1) / 2);
+        const size_t vf = (size_t) (((int64_t) g.kv_row_v() * ring + 1) / 2);
+        size_t at = 0;
+        for (int il : swa_ring_layers()) {
+            float* k = state_ + dsa_lat_[(size_t) il];
+            float* v = state_ + dsa_ik_[(size_t) il];
+            cudaMemcpyAsync(restore ? k : host + at, restore ? host + at : k, kf * sizeof(float),
+                            restore ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost, fast_->cs);
+            cudaMemcpyAsync(restore ? v : host + at + kf, restore ? host + at + kf : v, vf * sizeof(float),
+                            restore ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost, fast_->cs);
+            at += kf + vf;
+        }
+        return;
+    }
     const std::vector<int> ls = dsa_layers();
     const int64_t rows = (int64_t) (g.idx_kpool - 1) * g.idx_key;   // floats per cache
     if (ls.empty() || rows <= 0 || ik_ring_ <= 0) return;
@@ -6224,6 +6675,7 @@ void Glm5Model::ckpt_pool_copy(int64_t pos, float* host, bool restore) {
 }
 
 bool Glm5Model::ckpt_save(int slot, std::string& err) {
+    // (KV8: a mimo2 checkpoint holds the FP16 SWA rings only - the int8 full layers are positional, not copied)
     if (slot < 0) {
         err = "checkpoint: no slot";
         return false;
@@ -6238,7 +6690,9 @@ bool Glm5Model::ckpt_save(int slot, std::string& err) {
         const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
         int n_rec = 0;
         for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
-        const size_t pool = m->dsa_layers().size() * 2 * (size_t) (g.idx_kpool - 1) * (size_t) g.idx_key;
+        const size_t pool = g.arch == Glm5Geometry::Glm5Arch::Mimo2
+                                ? m->snap_pool_floats()   // (mimo2: its SWA rings, ckpt_pool_copy)
+                                : m->dsa_layers().size() * 2 * (size_t) (g.idx_kpool - 1) * (size_t) g.idx_key;
         if ((int) m->ckpt_buf_.size() <= slot) {
             m->ckpt_buf_.resize((size_t) slot + 1);
             m->ckpt_pos_.resize((size_t) slot + 1, -1);
@@ -6272,6 +6726,7 @@ bool Glm5Model::ckpt_save(int slot, std::string& err) {
 }
 
 bool Glm5Model::ckpt_restore(int slot, std::string& err) {
+    // (KV8: a mimo2 checkpoint holds the FP16 SWA rings only - the int8 full layers are positional, not copied)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ == nullptr || slot < 0 || (int) m->ckpt_pos_.size() <= slot || m->ckpt_pos_[(size_t) slot] < 0 ||
             m->ckpt_pos_[(size_t) slot] != ckpt_pos_[(size_t) slot]) {
@@ -6342,6 +6797,7 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const Glm5Geometry& g, boo
 }  // namespace
 
 uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
+    if (mimo_kv8_) { err = "STRATA_MIMO_KV8=1: disk slots / host checkpoints are unsupported; use in-memory snapshot_save/restore"; return 0; }
     std::vector<Glm5Model*> halves;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr || m->snap_pos_ < 0 || m->snap_pos_ != snap_pos_) {
@@ -6418,6 +6874,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
 }
 
 bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err) {
+    if (mimo_kv8_) { err = "STRATA_MIMO_KV8=1: disk slots / host checkpoints are unsupported; use in-memory snapshot_save/restore"; return false; }
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
     std::ifstream f(path, std::ios::binary);
     if (!f) {

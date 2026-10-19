@@ -1,0 +1,55 @@
+{
+ "exe": "build/strata",
+ "args": [
+  "--glm-pack",
+  "models/MiMo-V2.6-Pro-Uncensored-Maya/pack",
+  "--max-context",
+  "512000",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "4096",
+  "--vision"
+ ],
+ "cwd": ".",
+ "tokenizer": "models/MiMo-V2.6-Pro-Uncensored-Maya/pack/tokenizer",
+ "model_name": "mimo-pro",
+ "gpu": [
+  0,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7
+ ],
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95
+ },
+ "reasoning_effort": "high",
+ "env": {
+  "STRATA_MIMO_DEV": "1",
+  "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+  "CUDA_VISIBLE_DEVICES": "0,2,3,4,5,6,7",
+  "STRATA_GLM_SPLIT": "11,22,33,44,53,61",
+  "STRATA_GLM_SPEC_HEAD": "4",
+  "STRATA_GLM_MTP_PIPE": "1",
+  "STRATA_GLM_MTP_DRAFT": "7",
+  "STRATA_GLM_MTP_PIPE_FRESH": "0",
+  "STRATA_MIMO_MTP3": "1",
+  "STRATA_GLM_SPEC_SAMPLE": "1",
+  "STRATA_GLM_CPU_LANE": "0",
+  "STRATA_GLM_PREFILL_CPU": "0",
+  "STRATA_GLM_LOOKUP": "1",
+  "STRATA_MIMO_KV8": "1"
+ },
+ "vision": {
+  "exe": "tools/mimo/mimo_vision.py",
+  "mmproj": "models/MiMo-V2.6-Pro-Uncensored-Maya/vision",
+  "model": "models/MiMo-V2.6-Pro-Uncensored-Maya/vision",
+  "gpu": true,
+  "threads": 16,
+  "max_tokens": 1024
+ }
+}

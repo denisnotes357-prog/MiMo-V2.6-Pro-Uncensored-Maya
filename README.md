@@ -1,112 +1,129 @@
-# GLM-5.3 Uncensored on Maya
+# MiMo-V2.6-Pro Uncensored on Maya
 
-**The full 753B-parameter GLM-5.3, uncensored, running at 43–57 tokens/s on seven consumer-and-datacenter GPUs, with 512K context.**
+**Xiaomi's ~1-trillion-parameter MiMo-V2.6-Pro, uncensored, with its own vision, running at 55–75 tokens/s on seven GPUs with a 512K context.**
 
-This repository is a fork of [Project Maya](https://github.com/mw00/project-maya) (MIT), the engine that runs GLM-5.3-*Flash* on your own GPUs. Maya only supported the Flash model. Here the engine is ported to the **full GLM-5.3** (`glm-dsa`: MLA attention with RoPE, the token-level DSA indexer, 78 layers + NextN), a calibrated 2–3 bit quant is built for it, and refusals are removed in two steps: donor weights, then a runtime refusal vector.
+This repository is a fork of [Project Maya](https://github.com/mw00/project-maya) (MIT), the engine that runs large MoE models on your own GPUs. Maya did not know MiMo. Here the engine is ported to **MiMo-V2.6-Pro** (architecture `mimo2`: 70 layers, 384 experts, hybrid sliding-window + full attention with sinks, three multi-token-prediction layers, a native vision tower), a calibrated ~2-bit quant is built for it (300 GB, Russian kept intact), refusals are removed by a runtime refusal vector, and decoding is made fast enough for daily use — from 31 tok/s at the first working build to 55–75 tok/s now, and from 20 to 38–40 tok/s at 200K context.
 
-[Русская версия](README.ru.md) · [How it was made](docs/HOW-IT-WAS-MADE.md) · [Engine port](docs/GLM53-ENGINE-PORT.md) · [Model on Hugging Face](#download-the-model) · [Original Project Maya README](README.project-maya.md)
+[Русская версия](README.ru.md) · [How it was made](docs/HOW-IT-WAS-MADE.md) · [Engine port](docs/MIMO2-ENGINE-PORT.md) · [Model on Hugging Face](#download-the-model) · [GLM-5.3 Uncensored on Maya](https://github.com/denisnotes357-prog/GLM-5.3-Uncensored-Maya) · [Original Project Maya README](README.project-maya.md)
 
 ---
 
 ## Results
 
-| | Stock GLM-5.3 (our quant) | **GLM-5.3 Uncensored (this repo)** |
-| --- | ---: | ---: |
-| Refusals on 40 JailbreakBench requests | 39 / 40 | **2 / 40** |
-| Decode speed, English | 55–57 tok/s | **54 tok/s** |
-| Decode speed, Russian | 45 tok/s | **43–45 tok/s** |
-| Context | 256K | **512K** (1M works, ~30 tok/s) |
-| Size | 267 GB | 267 GB GGUF + 2.8 GB pack |
-| Quality vs the FP8 original (KL, 8 texts) | 0.204 (top-1 agreement 88.4%) | same weights except 155 donor tensors |
+Measured on 5× RTX 4090 48 GB + 2× A100 40 GB (320 GB VRAM), 503 GB RAM; 400-token answers unless noted.
 
-Hardware: 5× RTX 4090 48 GB + 2× A100 40 GB (320 GB VRAM total), 503 GB RAM. All experts live in VRAM; nothing is read from disk while generating.
+| | **MiMo-V2.6-Pro Uncensored (this repo)** |
+| --- | ---: |
+| Refusals on 40 JailbreakBench requests (judge: the same quant without the vector) | **1 / 40** (24 / 40 without the vector) |
+| Decode, Russian / code, temperature 0 | **55–58 / 71–75 tok/s** |
+| Decode, Russian / code, temperature 1 | **53–55 / 64–75 tok/s** |
+| Decode when the answer repeats the context (code edits, proofreading) | **106–116 tok/s** |
+| Decode at 100K / 200K context | **38 / 38–40 tok/s** |
+| Prompt reading | **1500–1900 tok/s**; a 200K prompt in 155 s; a short chat turn in 0.15 s |
+| A new question to an already-read 200K conversation | **~1 s** (only its own tokens are read) |
+| An image | **~1.6 s** to encode (the model's own vision tower, on the GPU) |
+| Context | **512K**, every expert in VRAM |
+| Russian perplexity (full-precision model ≈ 3.8) | 4.03 without the vector, 5.12 with it; English 4.06 |
+| Size | 300 GB GGUF + 0.3 GB pack + 1.5 GB vision tower |
 
-Speed history of the port on that machine: 14.5 tok/s (first working build, larger quant) → 20 (MTP) → 38.6 (smaller calibrated quant) → **45–57 (pipelined MTP window)**. Without MTP: 24 tok/s.
+Speed history on that machine: 31 tok/s (plain decoding) → 45 / 59 (one MTP layer, pipelined window) → 52 / 66 (all three MTP layers, as the model was trained) → **55–58 / 71–75** (speculative sampling, no CPU lane, prompt lookup). Long context: 7.4 tok/s at 70K → 32 (split-K attention) → **38–40 at 200K** (tensor-core attention + INT8 KV cache).
 
 ## What is in here
 
-- **Engine port to `glm-dsa`** (`src/core/glm_*.cu`, `src/kernels/cuda/glm_*.cu`): the full GLM-5.3 inside Maya's existing `Glm5Model`, behind architecture flags, so Flash keeps working and GLM-5.3 inherits everything Maya already had — the VRAM/RAM/disk expert tiers, splitting layers across GPUs, multi-token prediction, batched prompt processing, KV streaming, the OpenAI/Anthropic-compatible server and the browser chat.
-- **Pipelined MTP window** (`STRATA_GLM_MTP_PIPE=1`, `decode_mtp_pipe` in `src/core/glm_mtp.cu`): the NextN head drafts a chain of up to 7 tokens on the last GPU, and the chain is verified as a window flowing through all seven GPUs. Output is token-for-token identical to plain decoding; speed goes from ~32 to 45–57 tok/s.
-- **Runtime refusal vector** (`src/core/glm_ablate.cuh`, `STRATA_GLM_ABLATE*`): three directions per layer projected out of the residual stream after every layer. No requantization — switch it off, or change its strength, in the config.
-- **Quantization toolchain** (`tools/glm53/`): FP8 calibration statistics, imatrix + GPTQ for the experts, the recipes, the donor merge (`make_gm24u.py`), the refusal-direction capture (`tools/glm53/ablate/`).
-- **Tests**: a 6-layer synthetic GLM-5.3 checked against `transformers` (`tests/glm_dsa_model_test.cpp`), slow-vs-fast path parity, the geometry loader test.
+- **Engine port to `mimo2`** (`src/core/glm_*.cu`, `src/kernels/cuda/mimo_*.cu`, `include/strata/kernels/mimo_*.hpp`): MiMo-V2.6-Pro inside Maya's `Glm5Model`, behind an architecture flag, so the GLM models keep working and MiMo inherits Maya's expert tiers, layer split across GPUs, OpenAI/Anthropic-compatible server and browser chat. Sliding-window layers keep a 256-row ring per layer; full-attention layers keep the whole context.
+- **All three native MTP layers** (`STRATA_MIMO_MTP3=1`): layer *k* drafts depth *k* from the trunk's hidden state, which is how MiMo was trained (chaining one layer three times leaves depth 2–3 nearly useless: 16 % / 3 % against 56 % / 54 % in a `transformers` reference). The drafts are verified as one window flowing through all seven GPUs.
+- **Speculative sampling** of the drafts at temperature > 0 (`STRATA_GLM_SPEC_SAMPLE=1`), checked against plain sampling (same distribution, χ² test).
+- **Prompt-lookup drafts** (`STRATA_GLM_LOOKUP=1`): when the text repeats something from the conversation, up to 7 tokens of it are drafted at once.
+- **Batched prompt reading** for `mimo2` (sliding-window + sink attention on tensor cores, chunks of 4096) and a pipelined window for short pieces (a new chat turn).
+- **Tensor-core decode attention** for the full-attention layers (the 16 query heads of a KV head form one `mma` tile), memory-bound at 200K context; **INT8 KV cache** for those layers (`STRATA_MIMO_KV8=1`) — half the memory and traffic.
+- **Conversation checkpoints**: the sliding-window rings at the start of the last turn are kept in RAM, so a different follow-up to a long conversation reads only its own tokens.
+- **Native vision** (`tools/mimo/mimo_vision.py`): the checkpoint's own vision transformer, run on the first GPU in VRAM the engine lends it while a picture is encoded; a pre-warmed process forks one encoder per picture.
+- **Runtime refusal vector** (`STRATA_GLM_ABLATE*`): six directions per layer projected out of the residual stream after every layer. No requantization — change its strength or switch it off in the config.
+- **Quantization toolchain** (`tools/mimo/`): calibration statistics with Russian text, imatrix/GPTQ quantization, the MTP-layer fix, refusal-direction capture and derivation, reference scripts, benchmarks.
+- **Tests**: decode and prefill attention against FP64 references (`tests/mimo_decode_attn_test.cu`, `tests/mimo_prefill_attention.cu`), the `mimo2` geometry loader (`tests/mimo_geometry_test.cpp`).
 
 ## Quick start
 
 ### 1. Build the engine
 
-The same installer as upstream Maya (Linux x86-64, NVIDIA driver, CUDA 12.x or 13, Python 3.10+; see
-[Project Maya's requirements](README.project-maya.md)):
+The same installer as upstream Maya (Linux x86-64, NVIDIA driver, CUDA 12.x or 13, Python 3.10+; see [Project Maya's requirements](README.project-maya.md)):
 
 ```bash
-git clone https://github.com/denisnotes357-prog/GLM-5.3-Uncensored-Maya
-cd GLM-5.3-Uncensored-Maya
+git clone https://github.com/denisnotes357-prog/MiMo-V2.6-Pro-Uncensored-Maya
+cd MiMo-V2.6-Pro-Uncensored-Maya
 ./setup.sh
 ```
 
-It creates the private Python environment `.venv`, fetches ggml at the pinned llama.cpp commit and builds `build/strata`.
-When it offers to download a model, answer **no** — it would fetch GLM-5.3-Flash, not this model. Rebuilding later:
-`cmake --build build -j --target strata`. The port was built and tested for `sm_80` (A100) and `sm_89` (RTX 4090).
+It creates the Python environment `.venv`, fetches ggml at the pinned llama.cpp commit and builds `build/strata`. When it offers to download a model, answer **no** — it would fetch a different model. Rebuilding later: `cmake --build build -j --target strata`. The port was built and tested for `sm_80` (A100) and `sm_89` (RTX 4090).
+
+For images, the vision tower runs in PyTorch inside the same environment:
+
+```bash
+.venv/bin/pip install torch transformers safetensors pillow
+```
 
 ### 2. Download the model
 
 ```bash
 pip install -U huggingface_hub
-hf download nofacedfl/GLM-5.3-Uncensored-Maya --local-dir models/GLM-5.3-Uncensored-Maya
+hf download nofacedfl/MiMo-V2.6-Pro-Uncensored-Maya --local-dir models/MiMo-V2.6-Pro-Uncensored-Maya
 ```
 
-The download is ~270 GB: six GGUF shards and `pack/` (the engine's index of those shards plus the dense weights; it finds the shards next to itself).
+About 302 GB: seven GGUF shards, `pack/` (the engine's index of those shards, the dense weights and the tokenizer; it finds the shards next to itself), `vision/` (the vision tower) and the refusal vector.
 
 ### 3. Run
 
 ```bash
-tools/glm53/run-glm53.sh                                     # uncensored: donor weights + refusal vector
-tools/glm53/run-glm53.sh configs/glm53-uncensored-novector.json   # donor weights only
+tools/mimo/run-mimo-pro.sh                                           # uncensored: refusal vector on
+tools/mimo/run-mimo-pro.sh configs/mimo-pro-uncensored-novector.json  # without the vector
 ```
 
-- Chat in the browser: http://127.0.0.1:8095/
-- OpenAI API: `http://127.0.0.1:8095/v1/chat/completions`, model `glm-5.3`
-- Anthropic API: `http://127.0.0.1:8095/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8095`)
-- Thinking: `reasoning_effort` = `none` / `low` / `high` (default) / `max`
-- Live speed monitor: http://127.0.0.1:8095/#monitor
+- Chat in the browser: http://127.0.0.1:8098/
+- OpenAI API: `http://127.0.0.1:8098/v1/chat/completions`, model `mimo-pro` (images as `image_url`)
+- Anthropic API: `http://127.0.0.1:8098/v1/messages` (Claude Code and other agents: `ANTHROPIC_BASE_URL=http://127.0.0.1:8098`)
+- Thinking: `reasoning_effort` = `none` / `low` / `high` (default) / `max`, or `chat_template_kwargs: {"enable_thinking": false}`
+- Live speed monitor: http://127.0.0.1:8098/#monitor
 
-Loading takes about 3 minutes (the experts are warmed into VRAM). The server log should contain
-`glm ablate: 1437696 values from tools/glm53/ablate/dir3.f32 ... per layer, scale 1.00`.
+Loading takes 2–3 minutes. Stop any other GPU job first; Ctrl+C stops the model.
 
 ### Fitting your GPUs
 
-The shipped config is for 7 GPUs with ~320 GB of VRAM. The keys that matter:
+The shipped config is for 7 GPUs with ~320 GB of VRAM (GPU 1 of that machine left out). The keys that matter:
 
 | Key | Meaning |
 | --- | --- |
-| `gpu: [5, 0, 2, 3, 4, 7, 6]` | the order of the cards along the layer pipeline (the slower A100s at the ends) |
-| `STRATA_GLM_SPLIT=10,22,34,46,58,70` | first layer of each next GPU; every part must start on a layer with its own DSA indexer |
-| `--max-context 512000` | 512K fits without moving experts out of VRAM on this machine; 1M works with ~30% of experts in RAM |
-| `STRATA_GLM_RAM_RESIDENT=1` | whatever does not fit in VRAM is served from RAM, never from disk |
-| `STRATA_GLM_MTP_PIPE=1`, `STRATA_GLM_MTP_DRAFT=7` | the pipelined MTP window |
-| `STRATA_GLM_ABLATE_SCALE` | strength of the refusal vector (default 1.0; 1.5 was worse) |
-| `STRATA_GLM_DSA_DEV=1` | the GLM-5.3 path is marked experimental; the engine refuses `glm-dsa` without it |
+| `gpu`, `CUDA_VISIBLE_DEVICES` | the cards along the layer pipeline |
+| `STRATA_GLM_SPLIT=11,22,33,44,53,61` | the first layer of each next GPU (the two A100s get fewer layers) |
+| `--max-context 512000` | with `STRATA_MIMO_KV8=1` every expert stays in VRAM at 512K on this machine |
+| `STRATA_MIMO_MTP3=1`, `STRATA_GLM_MTP_PIPE=1`, `STRATA_GLM_MTP_DRAFT=7` | native three-layer MTP drafting, verified as a pipelined window |
+| `STRATA_GLM_SPEC_SAMPLE=1`, `STRATA_GLM_LOOKUP=1` | speculative sampling of drafts; prompt-lookup drafts |
+| `STRATA_GLM_CPU_LANE=0`, `STRATA_GLM_PREFILL_CPU=0` | no experts on the CPU — faster here and (nearly) deterministic |
+| `STRATA_MIMO_KV8=1` | INT8 KV cache for the 10 full-attention layers |
+| `STRATA_GLM_ABLATE_SCALE=0.35` | strength of the refusal vector (1.0 overshoots and damages Russian) |
+| `vision.gpu: true` | the vision tower on the first GPU (5.7 GB lent by the engine per picture) |
+| `STRATA_MIMO_DEV=1` | the `mimo2` path is marked experimental; the engine refuses it without this |
 
-With less VRAM, Maya's tiers still work: experts that do not fit are served from RAM (slower, see the 1M-context numbers).
+With less VRAM, Maya's tiers still work: experts that do not fit are served from RAM (slower).
 
 ## How the uncensoring works
 
-1. **Donor weights.** [`dealignai/GLM-5.3-UNCENSORED-FP8`](https://huggingface.co/dealignai/GLM-5.3-UNCENSORED-FP8) (MIT) differs from the original only in `self_attn.o_proj` and `mlp.shared_experts.down_proj` — 155 tensors, 8.9 GB. We downloaded just those tensors, quantized them to the same types our quant uses, and swapped them in (`tools/glm53/make_gm24u.py`). Refusals: 39 → 6 of 40.
-2. **Runtime refusal vector.** For the remaining refusals, three directions per layer (no thinking / open thinking / end of the model's own thinking) are measured on 256 harmful vs 100 harmless prompts and projected out of the residual stream after every layer while generating. Refusals: 6 → 2 of 40. The method and the original engine hook come from [alesha-pro](https://github.com/alesha-pro/project-maya/blob/glm-ablate/docs/GLM-ABLATE.md), who did it for GLM-5.3-Flash; here it is measured anew for the full 78-layer model.
+1. **The base** is [`pqhaz/MiMo-V2.6-Pro-MOPD-heretic`](https://huggingface.co/pqhaz/MiMo-V2.6-Pro-MOPD-heretic) (MIT): Xiaomi's MiMo-V2.6-Pro-MOPD with a two-stage directional ablation in its attention output projections. Through our quant it still refused 24 of 40 JailbreakBench requests.
+2. **Runtime refusal vector.** Six refusal directions per layer were measured from the residual stream on harmful vs harmless instructions (`tools/mimo/capture.py`, `derive.py`) and are projected out after every layer while generating. Strength 0.35 brings refusals to **1 / 40**, leaves harmless prompts untouched and keeps Russian usable (perplexity 5.1 vs 4.0 without the vector); strength 1.0 — the usual choice — pushed Russian perplexity to 9.7.
 
-The two remaining refusals are the heaviest topics (harm to children, eating disorders), where the model turns the answer into a safe one. Details, numbers and dead ends: [docs/HOW-IT-WAS-MADE.md](docs/HOW-IT-WAS-MADE.md).
+The quant itself is calibrated with ~14 % Russian text: an earlier quant calibrated on English only had a Russian perplexity of 44.8. Details, numbers and dead ends: [docs/HOW-IT-WAS-MADE.md](docs/HOW-IT-WAS-MADE.md).
 
 ## Download the model
 
-**Hugging Face:** [nofacedfl/GLM-5.3-Uncensored-Maya](https://huggingface.co/nofacedfl/GLM-5.3-Uncensored-Maya)
+**Hugging Face:** [nofacedfl/MiMo-V2.6-Pro-Uncensored-Maya](https://huggingface.co/nofacedfl/MiMo-V2.6-Pro-Uncensored-Maya)
 
 | File | Size |
 | --- | ---: |
-| `GLM-5.3-Maya-G-M24U-GPTQ-0000{1..6}-of-00006.gguf` | 267 GB |
-| `pack/` (engine index + dense weights + tokenizer + chat template) | 2.8 GB |
-| `dir3.f32` (refusal vector, 78 × 3 × 6144 float32; also in this repo) | 5.8 MB |
+| `MiMo-V2.6-Pro-heretic-M23B-0000{1..7}-of-00007.gguf` | 300 GB |
+| `pack/` (engine index + dense weights + tokenizer + chat template) | 0.3 GB |
+| `vision/` (the vision tower, 364 `visual.*` tensors in BF16, + config) | 1.5 GB |
+| `refusal-vector-L70.f32` (70 layers × 6 directions × 6144, float32) | 10 MB |
 
-Quant recipe (`tools/glm53/recipes/g-m24a.json`): experts IQ2_S gate/up and IQ3_XXS down (IQ3_S down in layers 3–6 and 74–77), GPTQ-rounded against FP8 calibration statistics; attention projections and the shared expert Q4_K, on the A100 layers Q8_0; NextN Q3_K/Q4_K; router and norms F32. The tensor layout follows llama.cpp's `glm-dsa`; the tested runtime is this engine.
+Quant recipe (`tools/mimo/recipes/m23.json`): routed experts IQ2_XXS gate/up and IQ2_S down (IQ2_XS / IQ3_XXS in the first and last layers), imatrix/GPTQ against full-precision calibration statistics; attention and the MTP layers Q4_K; router and norms F32. The tensor layout follows llama.cpp's `mimo2`; the tested runtime is this engine.
 
 ## Responsible use
 
@@ -114,10 +131,10 @@ This model will answer requests that the original refuses. It is published for r
 
 ## Credits and licenses
 
-- **Project Maya** by Niko1221 and the Strata contributors — the engine, server and quant tools this repo is built on. MIT, see [LICENSE](LICENSE). Fork base: upstream commit `d187195` (2026-10-15).
-- **GLM-5.3** by Z.AI — the model. [GLM-5.3 License](LICENSES/GLM-5.3-LICENSE.txt) (permissive; includes a security-review condition for very large Model-as-a-Service operators).
-- **dealignai** — the uncensored donor tensors, [GLM-5.3-UNCENSORED-FP8](https://huggingface.co/dealignai/GLM-5.3-UNCENSORED-FP8), MIT.
-- **alesha-pro** — the runtime ablation hook for Maya and the three-direction method, [project-maya `glm-ablate`](https://github.com/alesha-pro/project-maya/blob/glm-ablate/docs/GLM-ABLATE.md).
+- **Project Maya** by Niko1221 and the Strata contributors — the engine, server and quant tools this repo is built on. MIT, see [LICENSE](LICENSE).
+- **MiMo-V2.6-Pro** by [Xiaomi MiMo](https://huggingface.co/XiaomiMiMo) — the model (MIT); its modeling code in `tools/mimo/hf/` (Apache-2.0).
+- **pqhaz** — [MiMo-V2.6-Pro-MOPD-heretic](https://huggingface.co/pqhaz/MiMo-V2.6-Pro-MOPD-heretic), the attention-ablated base (MIT), using [Heretic](https://github.com/p-e-w/heretic).
+- **alesha-pro** — the runtime ablation hook for Maya, [project-maya `glm-ablate`](https://github.com/alesha-pro/project-maya/blob/glm-ablate/docs/GLM-ABLATE.md).
 - **llama.cpp** and **transformers** — the reference implementations the port was checked against.
 
 See [NOTICE.md](NOTICE.md) for the full list. If this project is useful to you, a ⭐ helps others find it.

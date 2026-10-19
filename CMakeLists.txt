@@ -242,6 +242,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/glm_fast.cu
                           src/kernels/cuda/glm_batch.cu
+                          src/kernels/cuda/mimo_prefill.cu
+                          src/kernels/cuda/mimo_decode_attn.cu
                           src/kernels/cuda/exl3.cu
                           src/kernels/cuda/exl3_legacy.cu
                           src/kernels/cuda/glm_kv_stream.cu
@@ -549,6 +551,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # committed Flash fixture (parse only: P1 changes no Flash bit), while the synthetic GLM-5.3
   # (tools/glm53/make_tiny.py -> /data/glm53/tiny/tiny-f32.gguf --expect-tiny) is checked by
   # hand in the report: that path is outside the repo.
+  if(STRATA_ENABLE_CUDA)
+    add_executable(mimo_prefill_attention_test tests/mimo_prefill_attention.cu)
+    target_link_libraries(mimo_prefill_attention_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME mimo_prefill_attention COMMAND mimo_prefill_attention_test)
+    add_executable(mimo_decode_attn_test tests/mimo_decode_attn_test.cu)
+    target_link_libraries(mimo_decode_attn_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME mimo_decode_attn COMMAND mimo_decode_attn_test)
+  endif()
+
+  add_executable(mimo_geometry_test tests/mimo_geometry_test.cpp)
+  target_include_directories(mimo_geometry_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(mimo_geometry_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
   add_executable(glm_dsa_geometry_test tests/glm_dsa_geometry_test.cpp)
   target_include_directories(glm_dsa_geometry_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_dsa_geometry_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})

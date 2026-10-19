@@ -1111,6 +1111,7 @@ class Vision:
         with self.lock:
             if key in self.cache:
                 return self.cache[key]
+            t0 = time.perf_counter()
             if self.proc is None:
                 self._start()
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
@@ -1122,6 +1123,8 @@ class Vision:
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
+            print(f"[maya] image encoded: {line}; start+encode_ms={(time.perf_counter() - t0) * 1000:.0f}",
+                  file=self.log or sys.stderr, flush=True)
             self.cache[key] = (out, int(line.split()[1]))
             if len(self.cache) > 64:                                   # oldest first
                 old = next(iter(self.cache))

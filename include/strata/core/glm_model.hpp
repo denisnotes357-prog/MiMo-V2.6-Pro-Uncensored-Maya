@@ -25,6 +25,7 @@
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -65,7 +66,9 @@ struct Glm5Geometry {
     // Which reader validated this GGUF: Flash = the released GLM-5.3-Flash runner exactly as it was
     // (glm5-next./glm5next. keys); Dsa = a full GLM-5.3 (general.architecture "glm-dsa"), whose keys
     // are parsed by from_gguf_dsa with no Flash fallback.  Set by from_gguf, before any field below.
-    enum class Glm5Arch { Flash, Dsa };
+    // Mimo2 = MiMo-V2.6-Pro (arch "mimo2", docs/MIMO2-ENGINE-PORT.md): plain GQA attention, parsed by
+    // from_gguf_mimo2; the MLA/DSA/KDA fields below keep their defaults and are not used by it.
+    enum class Glm5Arch { Flash, Dsa, Mimo2 };
     Glm5Arch arch = Glm5Arch::Flash;
     bool mhc = true;             // false: the plain residual of glm-dsa (no mixing, so hc = 1 and no
                                  // Sinkhorn); true is the mHC stack the Flash kernels compute
@@ -94,6 +97,28 @@ struct Glm5Geometry {
     // The SwiGLU clamp the FFN/MoE kernels apply (gate above, up both ends): the released Flash clamps
     // at 10, glm-dsa is unclamped and sets BOTH to +inf - every kernel's fminf/fmaxf is then a no-op.
     float swiglu_exp = 10.0f, swiglu_shexp = 10.0f;
+
+    // ---- mimo2 only (zero / empty for Flash and Dsa)
+    int head_k = 0, head_v = 0;        // q/k head dim (192) and v head dim (128): asymmetric GQA
+    int n_head_kv_gqa = 0;             // GQA kv heads (8); n_head q heads share them in groups
+    int rope_first = 0;                // RoPE on the FIRST rope_first dims of every q/k head (64)
+    float rope_base_swa = 10000.0f;    // rope.freq_base_swa: the SWA layers' base (rope_base = full)
+    int swa_window = 0;                // attention.sliding_window (128): keys i-window < j <= i
+    std::vector<int> swa_layer;        // per trunk layer: 1 = SWA with a sink, 0 = full attention
+    float v_scale = 1.0f;              // attention.value_scale (0.612), applied to V / the attention out
+    bool is_swa(int il) const { return !swa_layer.empty() && swa_layer[(size_t) il] != 0; }
+    int kv_row_k() const { return n_head_kv_gqa * head_k; }   // K floats per token of one layer
+    int kv_row_v() const { return n_head_kv_gqa * head_v; }   // V floats per token of one layer
+    // the token path keeps a SWA layer's K/V in a ring: the window plus room for a batch of positions written ahead
+    // of their attention (a verify window / prompt chunk)
+    // (STRATA_MIMO_RING_EXTRA: the room above the window, default 128 - a test sets it small to make the ring wrap)
+    int swa_ring() const {
+        static const int extra = [] {
+            const char* e = std::getenv("STRATA_MIMO_RING_EXTRA");
+            return e != nullptr && std::atoi(e) > 0 ? std::atoi(e) : 128;
+        }();
+        return swa_window + extra;
+    }
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
@@ -344,6 +369,7 @@ public:
     int bias_dev_ = -1;                                    // ... that device
     bool step_layers(int64_t p, std::string& err);
     bool step_layers_dsa(int64_t p, std::string& err);   // the glm-dsa reference step (GLM53-ENGINE-PORT P2)
+    bool step_layers_mimo2(int64_t p, std::string& err); // the mimo2 reference step (docs/MIMO2-ENGINE-PORT.md)
     // ---- the cross-token pipeline: with a split and more than one token to feed (a teacher-forced
     // prompt), the next token's first half is queued on device 0 BEFORE the host waits for this
     // token's residual, so half-A(t+1) runs while half-B(t) runs on device 1.
@@ -477,6 +503,12 @@ public:
     // ---- the fast path (src/core/glm_fast_path.cu)
     struct FastState;
     FastState* fast_ = nullptr;
+    bool mimo_kv8_ = false;  // latched at load; only full trunk layers, never SWA/MTP
+    bool mimo_kv8_layer(int il) const {
+        return mimo_kv8_ && g_.arch == Glm5Geometry::Glm5Arch::Mimo2 &&
+               il >= 0 && il < g_.n_layers && !g_.is_swa(il);
+    }
+    // KV8: dsa_lat_/dsa_ik_ are INT8 K/V, dsa_ig_/dsa_pool_ their FP32 scales.
     bool fast_mode_ = false;                               // decided at load (STRATA_GLM_SLOW=1 turns it off)
     bool host_logits_ = true;
     int last_tok_ = -1;                                    // the greedy argmax of the last fast forward
@@ -494,6 +526,9 @@ public:
     bool fast_layers(int64_t p, bool hop_in, std::string& err);
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
     bool fast_dsa53(int il, int64_t p, std::string& err);   // ... glm-dsa's (GLM53-ENGINE-PORT P3)
+    bool fast_mimo2(int il, int64_t p, std::string& err);   // ... mimo2's GQA (docs/MIMO2-ENGINE-PORT.md)
+    // mimo2 MTP: k (RoPE) / v of row p into its ring (il: the block, -1 = block 0)
+    bool mimo_mtp_kv_row(float* qkv, int64_t p, std::string& err, int il = -1);
     bool fast_moe(int il, bool& pf_pending, std::string& err);   // one MoE FFN (x -> ffn)
     // ... its routed experts, once the router and the shared expert's gate / up have run: the token path's own
     // activations, or one row of a batched step's (multi_rows)
@@ -540,6 +575,18 @@ public:
     float* snap_pool_ = nullptr;
     std::vector<int> dsa_layers() const;                   // this half's DSA layers (NextN block first), slot order
     void snap_pool_copy(bool restore);
+    // mimo2 (no indexer pool): the snapshot keeps this half's SWA K/V rings whole instead - the positions after the
+    // snapshot overwrite their rows (a full layer's cache holds every position: the position back is enough)
+    std::vector<int> swa_ring_layers() const;          // the MTP block first, then this half's SWA layers
+    size_t snap_pool_floats() const;                   // snap_pool_'s size for this architecture
+    void snap_ring_copy(bool restore);
+    // mimo2: the split-K GQA attention of a full layer (strata/kernels/mimo_decode_attn.hpp) for the token path and the
+    // verify window - its slices' scratch on this part's device (allocated on first use, ~34 MB); false: the per-head
+    // kernel does it (a short cache, STRATA_MIMO_DEC_OFF, or no scratch)
+    float* mimo_dec_scr_ = nullptr;
+    size_t mimo_dec_cap_ = 0;
+    bool mimo_dec_attn(int il, const float* q, int q_ld, const void* kc, const void* vc, int ring, int p0, int T, float* out,
+                       int out_ld, cudaStream_t s);
     int64_t snap_pos_ = -1;
     std::vector<std::vector<float>> ckpt_buf_;             // ckpt_save's checkpoints (this half): KDA runs, pool rows
     std::vector<int64_t> ckpt_pos_;                        // ... their positions (-1: none)
@@ -565,6 +612,15 @@ public:
     int mtp_src_ = -1;                                     // the shard of STRATA_GLM_MTP_GGUF's block, -1: the model's
     int lt_ = 0;                                           // the tier layers: [l0_, lt_) = the trunk's + the draft's
     void* mtp_arena_ = nullptr;
+    // mimo2's native multi-token prediction (STRATA_MIMO_MTP3=1): the checkpoint's MTP blocks 1 and 2
+    // (blk.<n_layers+1>, blk.<n_layers+2>) beside block 0, at layer slots mtp_il_ + 1, mtp_il_ + 2 - block k drafts
+    // depth k from the TRUNK's hidden state, as they were trained (tools/mimo/mtp3_ref.py: 60/56/54 % top-1 by depth,
+    // against 60/16/3 % for block 0 fed its own output)
+    int mtp_more_ = 0;
+    void* mtp_more_arena_ = nullptr;
+    bool load_mtp_more(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs, std::string& err);
+    bool mtp_native_ = false;   // a native round: fast_mtp's step k runs block k at the round's position
+    bool mtp_prov_ok_ = false;  // ... and block 2 first writes its provisional entry one position back (mtp_hprev holds it)
     uint64_t mtp_arena_bytes_ = 0;                         // (the VRAM report)
     bool load_mtp(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs, std::string& err);
     // the draft block at position p -> mtp_tok[step] (see glm_fast_path.cu: the chained drafts and the draft head)
@@ -660,6 +716,16 @@ public:
     bool mtp_pipe_ready() const;
     bool decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                          int64_t& produced, std::string& err);
+    /// A piece of the prompt too short for the prompt path (fewer than STRATA_GLM_PREFILL_MIN tokens - a chat's new
+    /// turn) through the pipelined window instead of the token path: windows of up to kPipeMax known tokens, every row
+    /// kept, the parts working on different tokens at once; the MTP blocks' caches get the rows too (the token path
+    /// leaves them behind on a split).  `next`: the token after the piece (-1: unknown).  No logits.
+    /// prompt_window_ready(): a split whose window is set up (mimo2; STRATA_GLM_PROMPT_WIN=0 turns it off).
+    bool prompt_window_ready() const;
+    /// decode_mtp_pipe's prompt-lookup drafts (STRATA_GLM_LOOKUP=1) read the context from here: the request's prompt,
+    /// set by the caller for the decode's span (null: no lookup)
+    const std::vector<int32_t>* look_ctx_ = nullptr;
+    bool prompt_window(const int32_t* tokens, int n, int32_t next, std::string& err);
 private:
     bool mtp_pipe_ = false;                                // the pipelined MTP decode is set up on this part
     std::vector<cudaEvent_t> mtp_step_ev_;                 // ... the last part's: a draft step's token copied out
@@ -684,7 +750,9 @@ private:
     void mtp_cache_free();
     // the NextN block's cache-writing half for n entries from p0: entry p0 + i from h + i * n_embd (device, this part)
     // and the token next[i] - eh_proj, the attention norm, kv_a and the indexer's key/gate, no query, no FFN
-    bool mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync = true);
+    // blk: which MTP block's ring (0 .. mtp_more_); its entry for position p0 + i reads h row i and token next[i]
+    bool mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync = true,
+                        int blk = 0);
 public:
     // ---- several conversations at once (src/core/glm_multi.cu, STRATA_GLM_SEQS=<n>): each part keeps n sequence
     // states (the state arena: residual, KDA states, DSA caches; the position, the snapshot) and binds one at a time -
@@ -752,6 +820,7 @@ public:
     void win_free();
     bool fast_window_layers(int64_t p0, int T, std::string& err);   // T rows through this part's layers
     bool fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& err);
+    bool fast_mimo2_window(int il, int64_t p0, int t0, int T, std::string& err);   // mimo2's GQA over window rows
     bool fast_moe_window(int il, int t0, int T, int part, int gid, std::string& err);
     /// The verify WINDOW: `tokens[0..T)` at positions position()..+T-1 (the last accepted token and T-1 drafts) through
     /// every part's layers in one pass; `out[t]` = the pick after token t - the greedy argmax, or with `sp` (not

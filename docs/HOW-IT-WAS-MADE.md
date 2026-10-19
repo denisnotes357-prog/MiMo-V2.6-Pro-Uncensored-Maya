@@ -1,101 +1,109 @@
-# How GLM-5.3 Uncensored on Maya was made
+# How MiMo-V2.6-Pro Uncensored on Maya was made
 
-## The idea
+The goal: Xiaomi's MiMo-V2.6-Pro — about a trillion parameters — running uncensored on one workstation, fast enough to
+chat with and to drive coding agents, in Russian as well as in English, with its own vision and a long context.
 
-[Project Maya](https://github.com/mw00/project-maya) is the fastest way to run GLM-5.3-**Flash** (321B) on your own GPUs: an engine built around one model, with experts tiered across VRAM, RAM and disk, multi-token prediction and a polished server. The **full** GLM-5.3 (753B) is a different architecture, and nothing ran it fast on a home multi-GPU box: llama.cpp works but does not split layers across GPUs with Maya's tricks, and vLLM needs the model to fit in FP8/INT4 across identical GPUs.
+The machine: 5× RTX 4090 48 GB + 2× A100 40 GB (320 GB VRAM, PCIe, no NVLink, no peer-to-peer between the 4090s),
+503 GB RAM. Every number below was measured there.
 
-The goal was simple to state:
+## 1. The starting point
 
-1. run the full GLM-5.3 on one workstation — 5× RTX 4090 48 GB + 2× A100 40 GB (320 GB VRAM), 503 GB RAM;
-2. as fast as the hardware allows, with long context;
-3. without the refusals of the stock model;
-4. without forking Maya into an unmaintainable copy — the port lives inside Maya's own model class behind flags, so upstream updates keep flowing in.
+[`pqhaz/MiMo-V2.6-Pro-MOPD-heretic`](https://huggingface.co/pqhaz/MiMo-V2.6-Pro-MOPD-heretic) is Xiaomi's
+MiMo-V2.6-Pro-MOPD with a two-stage refusal ablation in the 70 attention output projections; everything else is the
+original checkpoint (routed experts MXFP4, attention and dense weights FP8, embeddings and `o_proj` BF16, ~1 TB).
 
-It took two days (15–16 October 2026). Below is what was done, in order, with the numbers and the dead ends.
+The architecture, `mimo2`, is neither GLM nor Qwen:
 
-## 1. Mapping Flash's assumptions
+| | |
+| --- | --- |
+| Layers | 70 + 3 multi-token-prediction (MTP) layers |
+| Experts | 384 routed, top-8, expert FFN 2048; hidden 6144 |
+| Attention | GQA 128 query / 8 KV heads, q·k 192, v 128, a value scale |
+| Hybrid | 60 sliding-window layers (window 128, a learned sink logit per head) + 10 full-attention layers (0, 7, 15, 23, 31, 39, 47, 55, 62, 69) |
+| Vision | its own ViT (28 blocks, 739M parameters, windowed + full attention), merged 2×2 into 6144-wide tokens |
 
-Maya is written for one model. Before any code, every place that hard-codes Flash was listed: 4 hyper-connection streams (mHC), indexer pooling over 4 tokens, 45 layers, `n_embd` 4096 in kernels with fixed shared-memory arrays, a SwiGLU clamp. Several kernels silently truncate at 4096 — they were found here, not in a crash at 2 a.m.
+Maya (the engine) ran GLM models only. llama.cpp knew `mimo2` and was the math reference, together with `transformers`.
 
-## 2. One model with flags, not a copy of the engine
+## 2. The quant
 
-`Glm5Geometry` got architecture flags; `general.architecture` in the GGUF picks Flash (`glm5-next`) or GLM-5.3 (`glm-dsa`), and an unknown architecture is refused instead of falling back to Flash defaults.
+To fit 320 GB the experts had to go to ~2 bits. Recipe `tools/mimo/recipes/m23.json`: gate/up IQ2_XXS, down IQ2_S
+(IQ2_XS / IQ3_XXS in the first and last layers), attention and the MTP layers Q4_K, router and norms F32. Per-expert
+importance and GPTQ rounding use activation statistics collected from the full-precision model on one GPU
+(`tools/mimo/calib.py`, `quantize.py`). Result: 300 GB in seven GGUF shards.
 
-| | Flash | GLM-5.3 |
-| --- | --- | --- |
-| residual | 4 mHC streams | plain residual (`h += attn; h += ffn`) |
-| attention | MLA, latent 512 | MLA + RoPE tail: q = [nope 192 \| rope 64], cache row 576 |
-| DSA indexer | pools 4 tokens | selects single tokens, RoPE on 64 of 128 dims, LayerNorm with bias on k |
-| own indexer | every layer | 21 "full" layers; the other 57 reuse the previous full layer's selection |
-| layers | 45 | 78 + NextN |
-| SwiGLU clamp | 10 | none (+inf — a 0 would have zeroed ~35 gates) |
+Two problems on the way:
 
-The math reference was llama.cpp's `glm-dsa` (the commit Maya pins already supports it) and `transformers`' `glm_moe_dsa`. Details: [ENGINE-PORT.md](GLM53-ENGINE-PORT.md).
+- **The MTP layers came out broken.** llama.cpp's converter dequantized the fused q/k/v of the three MTP layers as plain
+  block-FP8, but the checkpoint stores them tensor-parallel-aware; the queries, keys and values were mixed up (relative
+  error 1.41). Draft acceptance was 2–6 %. `tools/mimo/check_mtp_qkv.py` found it, `fix_mtp_qkv.py` rewrites those three
+  tensors (relative error 0.072, the same as an ordinary layer); acceptance jumped to 68–84 % at depth 1.
+- **Russian broke.** The first quant (calibrated on English, with a refusal vector baked into the weights at strength 1.0)
+  had a Russian perplexity of 44.8 against ~3.8 for the full model. Two causes, measured separately: the vector alone
+  raised it to 9.3, the English-only calibration did the rest. The final quant M23B is calibrated with ~14 % Russian
+  text and has no baked vector: **Russian perplexity 4.03**.
 
-## 3. Proving it right before making it fast
+## 3. Refusals
 
-Stage by stage, each closed by a check:
+Through our quant the heretic base still refused 24 of 40 JailbreakBench requests (judged by the same quant without any
+vector). Six refusal directions per layer were measured from the residual stream on harmful vs harmless instructions
+(`tools/mimo/capture.py`, `derive.py`); the engine projects them out after every layer while generating
+(`STRATA_GLM_ABLATE`), so the strength is a config value:
 
-- **P0** — a synthetic GLM-5.3 (6 layers, hidden 512, 16 experts) built with `transformers`, converted to GGUF, logits saved as the reference.
-- **P1** — the loader and `iq_pack.py` for `glm-dsa`.
-- **P2** — a slow reference path (`STRATA_GLM_SLOW=1`): matches `transformers` on the synthetic model (max |Δ| ~3e-5 in F32).
-- **P3** — the fast token path: fast = slow (median logit correlation ≥ 0.999 on a quantized synthetic pack).
-- **First real answer**: the full GLM-5.3 (a large RTN quant, 362 GB) answered through the engine on one GPU + RAM at 3.6 tok/s; the first 18 greedy tokens matched llama.cpp exactly. All 1591 quantized tensors were checked against FP8.
-- **P4** — batched prompt processing on tensor cores: a 1970-token prompt in 9.3 s instead of 135 s; a 9318-token prompt 25.5 → 12.4 s; on long prompts ~890 tokens/s.
-- **Needle test**: a code hidden at token ~28K of a 71,274-token prompt came back exactly.
-- **P7** — seven GPUs, layers split `10,22,34,46,58,70` (every part must start on a layer with its own indexer), the A100s at the ends of the pipeline.
+| Strength | Russian perplexity (KL to the full model) | English perplexity (KL) | Refusals / 40 |
+| --- | --- | --- | --- |
+| 0 | 4.03 (0.17) | 4.25 (0.20) | 24 |
+| 0.25 | 4.44 (0.52) | 3.95 (0.52) | 5 |
+| **0.35 (shipped)** | **5.12 (0.71)** | **4.06 (0.60)** | **1** |
+| 0.5 | 7.31 (1.08) | 4.25 (0.70) | 1 |
 
-## 4. Making it fast
+Strength 1.0, the usual default, was 3–4× too strong for this model. Harmless prompts were untouched at every strength.
 
-- **Quant size decides speed.** With layers split across GPUs, a token visits the cards one after another, so speed ≈ bytes read per token ÷ one card's bandwidth. GLM-5.3 reads ~15 GB of dense weights per token in Q6_K against ~8 GB of experts, so the attention projections and shared expert went to **Q4_K** (recipe G-M24). Everything — all 256 experts of every layer — then fits in VRAM.
-- **Calibration, like Maya.** FP8 calibration statistics over 128 sequences of chat, multilingual chat, reasoning traces, code and tool calls → imatrix for every tensor and GPTQ for the experts' gate/up. Against FP8 on 8 held-out texts: **GPTQ KL 0.207, top-1 agreement 88.3%, ppl 3.37** versus round-to-nearest 0.262 / 86.5% / 3.55 — better on every text. On one probe layer the expert output error went RTN 0.147 → imatrix 0.108 → GPTQ 0.034. RTN also fell into a loop on a poem where GPTQ did not.
-- **The A100s are dequant-bound, not bandwidth-bound.** On the layers the split puts on the A100s, the dense tensors went to Q8_0, which an A100 unpacks at bandwidth (G-M24A; KL 0.204, top-1 88.4%).
-- **A pipelined MTP window.** Maya's multi-token drafting only worked on a single GPU; on a split it drafted one token per step. Here the NextN head drafts a chain of up to 7 tokens on the last GPU and the whole chain is verified as one window flowing through all seven GPUs (`STRATA_GLM_MTP_PIPE=1`). The answer is token-for-token the same as plain decoding. **32 → 45–57 tok/s.**
+## 4. The engine port
 
-Speed on that machine, 400-token answers:
+`mimo2` lives inside Maya's `Glm5Model` behind an architecture flag (`STRATA_MIMO_DEV=1`): a geometry loader, a slow
+reference path, the fast path with its own attention (sliding-window ring of 256 rows per layer, sink logits, value
+scale), dense MTP layers with their own rings, and the vision protocol. Correctness was checked step by step: a tiny
+synthetic `mimo2` against `transformers` (top-1 96/96, max |Δlogit| 2·10⁻⁶), fast path against slow path, the MTP layer
+against a reference (93.7 % of drafts identical), then the real quant on seven GPUs: **31 tok/s** without MTP.
 
-| Text | tok/s |
-| --- | ---: |
-| English technical | 55–56.8 |
-| Russian prose | 45 |
-| Chat at temperature 1.0 | 43–44 |
-| Without MTP | 24 |
+One crash on the way: a conversation snapshot copied GLM's indexer pool, which `mimo2` does not have — prompts of more
+than ~1000 tokens segfaulted. The snapshot of `mimo2` is its sliding-window rings.
 
-First token after a short prompt: 0.5–0.7 s.
+## 5. Making it fast
 
-### What did not pay off (and why)
+| Step | Result |
+| --- | --- |
+| Pipelined MTP window (drafts verified as one window through all 7 GPUs) | 45 / 59 tok/s (Russian / code) |
+| Batched prompt reading for `mimo2` (sliding-window + sink attention on tensor cores) | prompt reading 23–26 → 1250–1800 tok/s |
+| Split-K, GQA-sharing decode attention for the 10 full layers | 70K context: 7.4 → 32 tok/s |
+| **All three MTP layers, as trained.** A `transformers` reference over the trunk's hidden states showed that chaining layer 0 three times gives 16 % / 3 % at depths 2 / 3, while layer *k* at depth *k* gives 56 % / 54 %. | 52 / 66 tok/s |
+| The MTP layers' rings filled while the prompt is read (no cold start) | depth-2 acceptance 42 → 56 % |
+| Speculative sampling of drafts at temperature > 0 (a buffer bug made it produce garbage before) | t = 1: +5–12 % |
+| A short chat turn through the pipelined window instead of token by token | 0.5 → 0.15 s |
+| No experts on the CPU (they made greedy output depend on timing, and cost 0.8 ms a token) | 57 / 73 tok/s |
+| Prompt-lookup drafts (repeat the context 7 tokens at a time) | code edits 81 → 106, proofreading 79 → 116 tok/s |
+| Vision on the GPU (the engine lends 5.7 GB per picture) + a pre-warmed process that forks the encoder | 12 → 1.6 s an image |
+| **Tensor-core decode attention.** The old kernel read the KV cache at only 0.3 TB/s — it was compute-bound. The new one puts the 16 query heads of a KV head into one `mma` tile and reaches 0.94 TB/s. | 200K: 20 → 33 tok/s |
+| INT8 KV cache for the full layers (an FP32 scale per position and head) | 200K: 38–40 tok/s; every expert in VRAM at 512K |
+| Conversation checkpoints at the start of the last turn | another question to 200K: 3 min → ~1 s |
 
-- **Tensor parallelism** (all GPUs on every layer): the 48 GB RTX 4090s have no peer-to-peer, so every all-reduce goes through pinned RAM — measured 76 µs per round, ×156 rounds per token. Slower than the layer pipeline.
-- **The tinygrad P2P driver patch**: needs BAR1 ≥ VRAM; the 48 GB 4090s have a 32 GB BAR1 fixed in the VBIOS. Not possible.
-- **`k_b` / `v_b` in Q8 for the attention kernel**: no speedup (the cost is kernel launches, not bytes), slightly worse accuracy — reverted.
-- **1M context**: works, but the KV cache (12 GB per card) pushes ~40% of one card's experts to RAM: ~30 tok/s. 512K fits with no loss, so 512K is the default.
+## 6. Dead ends (measured, not kept)
 
-## 5. Removing the refusals
+- **Layer 0 at every depth without chaining**: no gain — its ring holds depth-1 entries.
+- **Longer or shorter drafts** (3–7): no difference; the per-depth acceptance is what matters.
+- **Moving layers from the A100s to the 4090s.** An A100 layer costs ~0.86 ms against ~0.43 ms on a 4090 (the IQ2
+  unpacking is compute-bound there), but the 4090s are full of experts: moving three layers cost more in RAM fetches
+  than it saved; moving one layer with a 256K context gained 2–3 %.
+- **INT8 KV on the old attention kernel**: slower than FP16 — the kernel was not limited by memory.
+- **Periodic checkpoints every 16K tokens**: each one ends a prompt-reading call, and a seven-GPU pipeline drains between
+  calls — a 200K prompt took 286 s instead of 191. Only turn boundaries are checkpointed now.
+- **DFlash** (MiMo ships a 5-layer block-diffusion drafter): on a PCIe pipeline every extra verified row costs ~7 ms,
+  so 8-token blocks would add ~10 % on code and almost nothing on prose. Not ported yet.
 
-The stock model refused **39 of 40** JailbreakBench requests (thinking off; the judge was the stock model itself, asked for one word: REFUSED / COMPLIED / DISPUTED).
+## 7. How correctness was checked
 
-**Step 1 — donor weights.** [`dealignai/GLM-5.3-UNCENSORED-FP8`](https://huggingface.co/dealignai/GLM-5.3-UNCENSORED-FP8) (MIT) was compared byte by byte with `zai-org/GLM-5.3`: only `self_attn.o_proj` and `mlp.shared_experts.down_proj` differ (155 tensors). Instead of downloading 756 GB, just those tensors (8.9 GB) were fetched with HTTP range requests, quantized to the types our quant already uses (worst relative error 0.08, as for the originals), and swapped in — `tools/glm53/make_gm24u.py`. Speed unchanged. **39 → 6 refusals.**
-
-**Step 2 — a runtime refusal vector.** The remaining refusals were the heaviest topics. Following [alesha-pro's method for GLM-5.3-Flash](https://github.com/alesha-pro/project-maya/blob/glm-ablate/docs/GLM-ABLATE.md), measured anew for the full model:
-
-- 256 harmful and 100 harmless prompts; the engine dumps the last-position residual of every layer (`STRATA_GLM_ABLATE_CAPTURE`) in three modes — thinking off, prompt ending on an open thinking block, and the model's own thinking followed by the closing marker;
-- per layer and mode: mean(harmful) − mean(harmless), minus its component along mean(harmless), normalized; the three directions orthonormalized (Gram–Schmidt); layer 0 left alone → `dir3.f32`, 78 × 3 × 6144;
-- while generating, after every layer's FFN write, the residual loses its components along that layer's three directions (`src/core/glm_ablate.cuh`). No weights change; the vector is a config switch.
-
-**6 → 2 refusals**, speed 44.8 / 54.1 tok/s (Russian / English). Strength 1.5 was worse (5 / 40). The two left are harm to children and eating disorders, where the model steers to a safe answer.
-
-## 6. Context and serving
-
-- 256K: 44.8 / 54.1 tok/s; **512K: 42.6 / 53.7, no experts leave VRAM** (KV 7.3 GB per card) — the default;
-- 1M: works, 25 → 30–33 tok/s as the expert cache warms.
-- The server is Maya's: browser chat, OpenAI and Anthropic APIs, a live monitor. One small addition for the capture: `chat_template_kwargs.maya_prefill` makes the answer continue a given text.
-
-## Open ends
-
-- Quality with the vector on (KL against the FP8 original with the same projection) was not measured.
-- Speculative sampling of the drafts at temperature > 0 (`STRATA_GLM_SPEC_SAMPLE=1`, +5–21% in chat) is not on by default until a larger quality check.
-- The FP8 original is no longer on the build machine, so the quant cannot be rebuilt from scratch there; the tools here rebuild it from `zai-org/GLM-5.3` + the donor tensors.
-
----
-
-The engineering was done by Denis with AI coding agents (Claude Code as the main engineer, a local model for mechanical work), every engine change checked against the references above.
+- Kernels against FP64 CPU references (`tests/mimo_decode_attn_test.cu`, `tests/mimo_prefill_attention.cu`).
+- Greedy output token-for-token equal between paths (prompt window vs token path, lookup drafts vs plain decoding).
+- Speculative sampling vs plain sampling: the same digit frequencies (χ² 3.9, threshold 16.9) and early-stop rates.
+- A fact hidden in the middle of 100K tokens of text is found (`tools/mimo/bench/needle.py`).
+- Long-context speed measured on a second question to the same context, so that the model cannot just copy the text.

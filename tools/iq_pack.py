@@ -118,25 +118,54 @@ GLMDSA_NATIVE_OK = (
     "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
     "token_embd.weight", "output.weight", "nextn.eh_proj.weight",
 )
-ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "glm-dsa")   # unsloth spells glm5-next without
+
+# The same two sets for "mimo2" (MiMo-V2.6, llama.cpp conversion/mimo.py -> every KV key is prefixed
+# "mimo2."): GQA attention with a FUSED qkv (attn_qkv, not MLA's attn_q_a/q_b/kv_a), NO mHC/KDA/indexer
+# - and NO shared expert: mimo2 writes no *_shexp anywhere (checked on synthetic GGUFs: zero such
+# tensors), so neither list mentions one and the packer never looks for one.  What travels beyond the
+# dense FFN is the router and its noaux_tc bias, the SWA attention sinks and the NextN block's norms.
+#
+# The BF16 list does NOT decide whether these tensors are packed: they are F32/BF16 in every
+# converter output, and any FLOAT already lands in dense.bin exactly as stored (the
+# `t.type_name in FLOAT` branch of index_standalone, index kinds 4/5/2).  What the list decides is
+# (a) the pack may only be built with --compat-bf16 while such a tensor is not BF16 yet, and
+# (b) under --compat-bf16 they are STORED as the BF16 the kernels read instead of the GGUF's F32 -
+# the glm-dsa convention this arch follows.  Removing them would build without --compat-bf16 and
+# keep them F32 instead.
+MIMO2_BF16 = (
+    "ffn_gate_inp.weight", "exp_probs_b.bias", "attn_sinks.weight",
+    "nextn.enorm.weight", "nextn.hnorm.weight",
+)
+# The ONLY non-expert tensors a mimo2 pack may serve NATIVELY (fail-closed like the GLM sets above):
+# the fused QKV, the output projection, the leading block's dense FFN, the embedding and the head,
+# plus the NextN block's eh_proj (that block's tensors sit under blk.{trunk}.* and are dropped with
+# the rest of the MTP block while the runner skips MTP).
+MIMO2_NATIVE_OK = (
+    "attn_qkv.weight", "attn_output.weight",
+    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+    "token_embd.weight", "output.weight", "nextn.eh_proj.weight",
+)
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "glm-dsa", "mimo2")   # unsloth spells glm5-next without
                                                                        # the hyphen; llama.cpp's GlmMoeDsa
-                                                                       # converter writes "glm-dsa"
+                                                                       # converter writes "glm-dsa"; llama.cpp's
+                                                                       # MimoV2Model writes "mimo2"
 
 
 def is_glm5(arch: str) -> bool:
-    """the architectures the GLM runner packs: Flash (glm5-next / glm5next) and the full GLM-5.3
-    (glm-dsa).  The KV prefix follows the arch string in every case."""
-    return arch in ("glm5-next", "glm5next", "glm-dsa")
+    """the architectures the GLM runner packs: Flash (glm5-next / glm5next), the full GLM-5.3
+    (glm-dsa) and - for the MiMo port - mimo2, the same runner code path (quantized dense served
+    natively, MoE in raw GGUF slices).  The KV key prefix follows the arch string in every case."""
+    return arch in ("glm5-next", "glm5next", "glm-dsa", "mimo2")
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
     if is_glm5(arch):
-        # neither GLM arch has PLE or output_hc, and its F32 router stays F32 (the runner reads it
-        # as F32 by config), so ONLY the listed projections take the BF16 path - the list differs:
-        # Flash also has the mHC mixes, the kpool compressors and the KDA gates, glm-dsa has none
-        # of those but does store the NextN block's norms.
-        return name.startswith("blk.") and name.endswith(
-            GLMDSA_BF16 if arch == "glm-dsa" else GLM5NEXT_BF16)
+        # none of these archs has PLE or output_hc, so ONLY the listed projections take the BF16
+        # path - and the list is per arch: Flash also has the mHC mixes, the kpool compressors and
+        # the KDA gates; glm-dsa has none of those but does store the NextN block's norms; mimo2 has
+        # no indexer and no MLA norms, only its router+noaux bias, SWA sinks and NextN norms.
+        table = {"glm-dsa": GLMDSA_BF16, "mimo2": MIMO2_BF16}
+        return name.startswith("blk.") and name.endswith(table.get(arch, GLM5NEXT_BF16))
     if name in BF16_OUTPUT:
         return True
     if not name.startswith("blk."):
@@ -234,8 +263,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
     else is a hard error.  The NextN/MTP block (blk.{block_count}.*, the runner skips MTP) is
     dropped from the pack entirely."""
     dropped = 0
-    native_ok = GLMDSA_NATIVE_OK if arch == "glm-dsa" else GLM5NEXT_NATIVE_OK
-    native_name = "GLMDSA_NATIVE_OK" if arch == "glm-dsa" else "GLM5NEXT_NATIVE_OK"
+    native_ok, native_name = {
+        "glm-dsa": (GLMDSA_NATIVE_OK, "GLMDSA_NATIVE_OK"),
+        "mimo2": (MIMO2_NATIVE_OK, "MIMO2_NATIVE_OK"),
+    }.get(arch, (GLM5NEXT_NATIVE_OK, "GLM5NEXT_NATIVE_OK"))
     if not compat_bf16:
         for name, (_, t, _, _) in model.where.items():
             if needs_bf16(name, t.type_name, arch) and t.type_name != "BF16" and not (
@@ -284,7 +315,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 fo.write(b"\0" * pad)
                 at += len(raw) + pad
             elif is_glm5(arch) and not name.endswith(native_ok):
-                label = "glm-dsa" if arch == "glm-dsa" else "glm5-next"
+                label = {"glm-dsa": "glm-dsa", "mimo2": "mimo2"}.get(arch, "glm5-next")
                 print("%s is %s: not on the BF16 upgrade list nor the %s native set "
                       "(%s); refusing to pack it silently"
                       % (t.name, t.type_name, label, native_name))
@@ -298,7 +329,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
     write_index(out, rows, src, served, 0)
     if compat_bf16:
         (out / "compat-bf16.json").write_text(json.dumps({
-            "source": str(src), "rounding": "nearest-even", "tensors": converted,
+            "source": src.name, "rounding": "nearest-even", "tensors": converted,
         }, indent=2) + "\n", encoding="utf-8")
         print("compat-bf16: %d tensors, %.2f GiB; expert and PLE table bytes unchanged"
               % (len(converted), sum(t["bytes"] for t in converted) / 2**30))
@@ -369,6 +400,51 @@ def index_from_base(a, src, base, out, g, T, mm) -> int:
     return 0
 
 
+# strata_tokenizer.py - the pack's reference tokenizer - transcribes exactly three pre-tokenizers
+# (its :94 refuses anything else).  MiMo's tokenizer is llama.cpp's "qwen2": the regex its
+# tokenizer.json quotes is llama-vocab.cpp:389 verbatim, and the export died with
+#     ValueError: the 'qwen2' pre-tokenizer is not transcribed; known: qwen35, glm4, glm5
+# Its NEAREST transcription is "qwen35" (llama-vocab.cpp:396): the two patterns differ only in the
+# \p{M} letter class, and neither sets ignore_merges.  Export under that spelling, saying so;
+# strata_tokenizer.py itself is not touched (M2 changes this file only).
+PRE_ALIAS = {"qwen2": "qwen35"}
+
+
+def export_tokenizer(src: pathlib.Path, out: pathlib.Path, metadata) -> int:
+    """write <out>/tokenizer/: strata_tokenizer.py as a subprocess, falling back to an in-process
+    PRE_ALIAS of the pre-tokenizer spelling when the module refuses an untranscribed one."""
+    cmd = [sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode == 0:
+        sys.stdout.write(res.stdout)
+        return 0
+    err = res.stdout + res.stderr
+    pre = str(metadata.get("tokenizer.ggml.pre", ""))
+    alias = PRE_ALIAS.get(pre)
+    if alias is None or "pre-tokenizer is not transcribed" not in err:
+        sys.stdout.write(res.stdout)
+        sys.stderr.write(res.stderr)
+        return 1
+    print("tokenizer: pre %r is not transcribed by strata_tokenizer.py; exporting it as %r "
+          "(same pattern except the \\p{M} letter class, llama-vocab.cpp:389 vs :396); "
+          "add the qwen2 transcription to strata_tokenizer.py to record the original spelling"
+          % (pre, alias))
+    import strata_tokenizer as st
+    orig = st.Tokenizer.__init__
+
+    def aliased(self, tokens, merges, token_types=None, pre="qwen35", special_ids=None):
+        orig(self, tokens, merges, token_types, PRE_ALIAS.get(pre, pre), special_ids)
+
+    st.Tokenizer.__init__ = aliased
+    argv = sys.argv
+    sys.argv = [cmd[1], *cmd[2:]]
+    try:
+        return int(st.main() or 0)
+    finally:
+        st.Tokenizer.__init__ = orig
+        sys.argv = argv
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
@@ -397,12 +473,16 @@ def main() -> int:
         return 1
     if is_glm5(arch):
         # two spellings in the wild for Flash: llama.cpp's canonical "glm5-next" (llama-arch.cpp L156) and
-        # unsloth's "glm5next" - plus llama.cpp's "glm-dsa" for the full GLM-5.3.  The KV PREFIX
-        # follows the arch string in every case, so it is read per file.
-        prefix = {"glm5-next": "glm5-next.", "glm5next": "glm5next.", "glm-dsa": "glm-dsa."}[arch]
+        # unsloth's "glm5next" - plus llama.cpp's "glm-dsa" for the full GLM-5.3 and llama.cpp's "mimo2"
+        # for MiMo-V2.6.  The KV PREFIX follows the arch string in every case, so it is read per file.
+        prefix = {"glm5-next": "glm5-next.", "glm5next": "glm5next.",
+                  "glm-dsa": "glm-dsa.", "mimo2": "mimo2."}[arch]
         if arch == "glm-dsa":
             print("%s: packing for the Glm5Model runner (GLM-5.3 geometry; quantized dense served "
                   "natively; docs/GLM53-ENGINE-PORT.md P1)" % arch)
+        elif arch == "mimo2":
+            print("%s: packing for the Glm5Model runner (MiMo-V2.6 geometry: fused QKV, GQA, SWA "
+                  "sinks, no shared expert; quantized dense served natively)" % arch)
         else:
             print("%s: packing for the Glm5Model runner (quantized dense served natively; the driver "
                   "gate remains closed until the pack wiring lands - docs/GLM5-FLASH.md §9)" % arch)
@@ -436,8 +516,9 @@ def main() -> int:
     if rc:
         return rc
     if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
-        subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
-                       check=True)   # writes <out>/tokenizer/
+        rc = export_tokenizer(src, out, g.metadata)   # writes <out>/tokenizer/
+        if rc:
+            return rc
 
     # ---- the experts
     if trunk is not None:
@@ -457,7 +538,19 @@ def main() -> int:
     else:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
-    if is_glm5(arch):
+    if arch == "mimo2":
+        # llama.cpp's mimo2 converter writes NO leading_dense_block_count key (checked on the synthetic
+        # GGUFs), and a leading dense block carries neither router nor experts - so the FIRST router
+        # names the MoE range.  Deriving it keeps mimo2 from reading a KV that is not there (blk.0).
+        routers = [int(n.split(".")[1]) for n in T
+                   if n.startswith("blk.") and n.endswith("ffn_gate_inp.weight")]
+        if not routers:
+            print("%s: no router (blk.*.ffn_gate_inp.weight) in the trunk; nothing to pack" % arch)
+            return 1
+        lead = min(routers)
+        print("%s: no leading_dense_block_count KV -> MoE layers from the first router: dense 0..%d"
+              % (arch, lead - 1))
+    elif is_glm5(arch):
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
     else:
         lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)

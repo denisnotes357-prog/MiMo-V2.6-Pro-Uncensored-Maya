@@ -61,6 +61,10 @@ struct Glm5Model::RowsState {
 int Glm5Model::rows_max() { return gf::kMaxMvNt; }
 
 bool Glm5Model::rows_alloc(std::string& err) {
+    if (mimo_kv8_) {
+        err = "STRATA_MIMO_KV8=1: one-GPU batched multi-sequence rows are unsupported; use one sequence or a layer split";
+        return false;
+    }
     if (rows_ != nullptr) return true;
     const Glm5Geometry& g = g_;
     const size_t R = (size_t) rows_max();

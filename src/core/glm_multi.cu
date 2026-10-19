@@ -1,3 +1,4 @@
+#include "strata/core/mimo_kv8.hpp"
 // src/core/glm_multi.cu - several conversations at once (STRATA_GLM_SEQS=<n>); see glm_model.hpp (SeqCtx).
 //
 // Every per-sequence thing a part keeps lives in its state arena (the residual, the KDA states and conv histories, the
@@ -75,6 +76,28 @@ void Glm5Model::seq_bind_all(int s) {
 // caches, then this part's layers - the offsets into c's vectors, the bytes returned
 uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
     const Glm5Geometry& g = g_;
+    if (mimo_kv8_) {
+        // Mirror load_pack exactly, including MTP blocks and unmodified FP16 SWA rings.
+        int64_t floats=2*(int64_t)g.hc*g.n_embd;
+        for(auto* v:{&c.kda_S,&c.kda_conv,&c.dsa_lat,&c.dsa_ik,&c.dsa_ig,&c.dsa_pool})
+            v->assign((size_t)g.n_layers+1+mtp_more_,0);
+        const auto layer=[&](int il, bool swa) {
+            const int64_t rows=swa?std::min<int64_t>(ctx,g.swa_ring()):ctx;
+            if(mimo_kv8_layer(il)) {
+                const MimoKv8Layout kv(floats,rows,g.n_head_kv_gqa,g.head_k,g.head_v);
+                c.dsa_lat[il]=kv.k;c.dsa_ig[il]=kv.ks;c.dsa_ik[il]=kv.v;c.dsa_pool[il]=kv.vs;
+                floats=kv.end;
+            } else {
+                c.dsa_lat[il]=floats;floats+=((int64_t)g.kv_row_k()*rows+1)/2;
+                c.dsa_ik[il]=floats;floats+=((int64_t)g.kv_row_v()*rows+1)/2;
+            }
+        };
+        if(mtp_il_>=0) for(int k=0;k<=mtp_more_;++k) layer(mtp_il_+k,true);
+        for(int il=l0_;il<l1_;++il) layer(il,g.is_swa(il));
+        c.ik_ring=(int)std::min<int64_t>(ctx,8192+64);
+        c.max_ctx=ctx;c.bytes=(uint64_t)floats*sizeof(float);
+        return c.bytes;
+    }
     const int64_t hc_dim = (int64_t) g.hc * g.n_embd;
     const int64_t max_pools = ctx / g.idx_kpool;
     int64_t floats = 2 * hc_dim;
@@ -126,7 +149,8 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     // the first sequence's layout recomputed must be the one load_pack made, or the others' would be wrong
     SeqCtx check;
     if (seq_layout(max_ctx_, check) != state_bytes_ || check.dsa_pool != dsa_pool_ || check.kda_conv != kda_conv_ ||
-        check.dsa_lat != dsa_lat_ || check.ik_ring != ik_ring_) {
+        check.dsa_lat != dsa_lat_ || check.ik_ring != ik_ring_ ||
+        (mimo_kv8_ && (check.dsa_ik != dsa_ik_ || check.dsa_ig != dsa_ig_))) {
         err = "glm multi: the state layout does not match load_pack's (this build cannot run STRATA_GLM_SEQS)";
         return false;
     }
@@ -159,7 +183,7 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
     int n_rec = 0;
     for (int il = l0_; il < l1_; ++il) n_rec += g.is_recr(il) ? 1 : 0;
-    const size_t pool_floats = dsa_layers().size() * 2 * (size_t) ((g.idx_kpool - 1) * g.idx_key);
+    const size_t pool_floats = snap_pool_floats();   // the indexer pool's rows, or mimo2's SWA rings
     for (int s = 0; s < n; ++s) {
         float*& snap = s == 0 ? snap_ : seq_[(size_t) s].snap;
         float*& snap_pool = s == 0 ? snap_pool_ : seq_[(size_t) s].snap_pool;

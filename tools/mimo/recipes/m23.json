@@ -1,0 +1,13 @@
+{"name": "MiMo-Pro-M23",
+ "note": "~2.35 bpw experts, ~280 GiB total so the whole model sits in 7 GPUs (320 GiB) with room for llama.cpp's whole-layer split, compute buffers and the KV of the 10 full-attention layers. gate/up IQ2_XXS (IQ2_XS in MoE layers 1-3 and 67-69); down IQ3_XXS in the outer layers 1-9 and 60-69, IQ2_S in 10-59 (down is the sensitive one; the outer layers the most). Attention qkv/o Q4_K (dense bytes set decode speed, as G-M24 for GLM-5.3). Router/bias F32, embed/output Q6_K, layer 0 dense Q6_K, MTP blocks 70-72 Q4_K. Reference point: AesSedai's target-bpw BPW2.5 (297.6 GiB) has KLD 0.262 vs BF16.",
+ "rules": [
+  {"match": "^blk\\.(7[0-2])\\.", "type": "Q4_K"},
+  {"match": "ffn_gate_inp|exp_probs_b", "type": "F32"},
+  {"match": "^blk\\.([1-3]|6[7-9])\\.ffn_(gate|up)_exps", "type": "IQ2_XS"},
+  {"match": "ffn_(gate|up)_exps", "type": "IQ2_XXS"},
+  {"match": "^blk\\.([1-9]|6[0-9])\\.ffn_down_exps", "type": "IQ3_XXS"},
+  {"match": "ffn_down_exps", "type": "IQ2_S"},
+  {"match": "^blk\\.\\d+\\.attn_(q|k|v|qkv|output)\\.weight$", "type": "Q4_K"},
+  {"match": "^blk\\.0\\.ffn_(gate|up|down)\\.weight$", "type": "Q6_K"}
+ ],
+ "default": "Q6_K"}

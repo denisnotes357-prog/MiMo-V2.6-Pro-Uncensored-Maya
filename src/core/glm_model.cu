@@ -1,3 +1,4 @@
+#include "strata/core/mimo_kv8.hpp"
 // src/core/glm_model.cpp - the glm5-next runner.  See glm_model.hpp for the contract.
 //
 // Everything below is the parity test's PROVEN arithmetic (glm_layer_parity) promoted into a
@@ -233,27 +234,42 @@ static const char* const kMtpF32[] = {"attn_norm.weight", "ffn_norm.weight", "at
                                       "indexer_compressor_ape.weight", "exp_probs_b.bias", "nextn.enorm.weight",
                                       "nextn.hnorm.weight", "nextn.shared_head_norm.weight"};
 
+// mimo2's MTP block (blk.<n_layers>.*): a SWA attention with its sink and a DENSE MLP - no experts, no indexer
+static const char* const kMtpRawMimo[] = {"attn_qkv.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight",
+                                          "ffn_down.weight", "nextn.eh_proj.weight"};
+static const char* const kMtpF32Mimo[] = {"attn_norm.weight", "ffn_norm.weight", "attn_sinks.weight", "nextn.enorm.weight",
+                                          "nextn.hnorm.weight", "layer_output_norm.weight"};
+struct MtpNames {
+    std::vector<const char*> raw, b16, f32;
+};
+static MtpNames mtp_names(bool mimo) {
+    if (mimo) return {{std::begin(kMtpRawMimo), std::end(kMtpRawMimo)}, {}, {std::begin(kMtpF32Mimo), std::end(kMtpF32Mimo)}};
+    return {{std::begin(kMtpRaw), std::end(kMtpRaw)}, {std::begin(kMtpB16), std::end(kMtpB16)},
+            {std::begin(kMtpF32), std::end(kMtpF32)}};
+}
+
 // ... and the VRAM they take
 // glm-dsa's NextN block has no k-pool compressor (its indexer selects tokens): those two names are absent there
 static bool mtp_absent_ok(const char* n, bool dsa) { return dsa && std::strstr(n, "indexer_compressor") != nullptr; }
 
 static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const std::string&)>& find, int il,
-                           uint64_t& bytes, std::string& err, bool dsa = false) {
+                           uint64_t& bytes, std::string& err, bool dsa = false, bool mimo = false) {
     const std::string P = "blk." + std::to_string(il) + ".";
     bytes = 0;
-    for (const char* n : kMtpRaw) {
+    const MtpNames nm = mtp_names(mimo);
+    for (const char* n : nm.raw) {
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
                  ~(uint64_t) 255u;
     }
-    for (const char* n : kMtpB16) {
+    for (const char* n : nm.b16) {
         if (mtp_absent_ok(n, dsa)) continue;
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
     }
-    for (const char* n : kMtpF32) {
+    for (const char* n : nm.f32) {
         if (mtp_absent_ok(n, dsa)) continue;
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
@@ -508,6 +524,79 @@ __global__ void mla_rope_attention_kernel(const float* __restrict__ q_abs, const
 
 int blocks(int n) { return (n + GM_THREADS - 1) / GM_THREADS; }
 
+// ---- mimo2 (MiMo-V2.6-Pro, docs/MIMO2-ENGINE-PORT.md): the reference step's own kernels
+
+// RoPE on the FIRST n_rot features of each of n_vec vectors (`stride` floats apart): LLAMA_ROPE_TYPE_NEOX, i.e.
+// transformers' rotate_half - the pair is (i, i + n_rot/2), theta_i = pos * base^(-2i / n_rot); the tail of every
+// head (head_dim - n_rot features) passes through.  The angle in double, as rope_norm_kernel.
+__global__ void rope_neox_kernel(float* __restrict__ x, int n_vec, int stride, int n_rot, long long pos, float base) {
+    const int half = n_rot / 2;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_vec * half) return;
+    const int v = idx / half, i = idx % half;
+    const double theta = (double) pos * pow((double) base, -2.0 * i / n_rot);
+    const float c = (float) cos(theta), sn = (float) sin(theta);
+    float* q = x + (size_t) v * stride;
+    const float a = q[i], b = q[i + half];
+    q[i] = a * c - b * sn;
+    q[i + half] = b * c + a * sn;
+}
+
+// One token's GQA attention, one block per q head: keys lo..p of the layer's caches (K [pos][n_kv][head_k],
+// V [pos][n_kv][head_v]), q head h reads kv head h / (n_head / n_kv).  softmax over the keys plus, on a SWA layer,
+// the head's learned sink logit (a column with no value: it only takes probability mass).  out = v_scale * P V
+// (transformers scales V before attention; the product is linear in V, so scaling the output is the same).
+// Dynamic shared memory: n_keys floats of scores.
+__global__ void gqa_attention_kernel(const float* __restrict__ q, const float* __restrict__ kc,
+                                     const float* __restrict__ vc, int n_head, int n_kv, int head_k, int head_v,
+                                     int lo, int p, const float* __restrict__ sinks, float scale, float v_scale,
+                                     float* __restrict__ out) {
+    extern __shared__ float sc[];
+    __shared__ float red[GM_THREADS];
+    const int h = blockIdx.x;
+    const int kvh = h / (n_head / n_kv);
+    const int n_keys = p - lo + 1;
+    const float* qh = q + (size_t) h * head_k;
+    for (int j = threadIdx.x; j < n_keys; j += blockDim.x) {
+        const float* kj = kc + ((size_t) (lo + j) * n_kv + kvh) * head_k;
+        float acc = 0.0f;
+        for (int d = 0; d < head_k; ++d) acc += qh[d] * kj[d];
+        sc[j] = acc * scale;
+    }
+    __syncthreads();
+    float m = -INFINITY;
+    for (int j = threadIdx.x; j < n_keys; j += blockDim.x) m = fmaxf(m, sc[j]);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s2]);
+        __syncthreads();
+    }
+    m = red[0];
+    const float sink = sinks != nullptr ? sinks[h] : -INFINITY;
+    m = fmaxf(m, sink);
+    __syncthreads();
+    float l = 0.0f;
+    for (int j = threadIdx.x; j < n_keys; j += blockDim.x) {
+        const float e = expf(sc[j] - m);
+        sc[j] = e;
+        l += e;
+    }
+    red[threadIdx.x] = l;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] += red[threadIdx.x + s2];
+        __syncthreads();
+    }
+    const float den = red[0] + (sinks != nullptr ? expf(sink - m) : 0.0f);
+    const float inv = v_scale / den;
+    for (int d = threadIdx.x; d < head_v; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < n_keys; ++j) acc += sc[j] * vc[((size_t) (lo + j) * n_kv + kvh) * head_v + d];
+        out[(size_t) h * head_v + d] = acc * inv;
+    }
+}
+
 __global__ void bias_apply_kernel(float* __restrict__ y, const float* __restrict__ bias, float alpha,
                                   int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -725,9 +814,143 @@ static bool from_gguf_dsa(const strata::GgufFile& g, Glm5Geometry& out, std::str
     return true;
 }
 
+// -----------------------------------------------------------------------------------------------
+// mimo2: MiMo-V2.6-Pro - KV prefix "mimo2.", what llama.cpp's MimoV2Model converter writes (conversion/mimo.py;
+// a synthetic fixture and the real quant shards).  Plain GQA (128 q / 8 kv, q/k 192, v 128), RoPE on the
+// first 64 dims with two bases (full / SWA), SWA window + per-head sink on the SWA layers, V x value_scale,
+// sigmoid router + exp_probs_b, no shared expert, layer 0 dense.  block_count counts the 3 MTP blocks in.
+// Parsing only: the attention is not ported yet and the forward guard below refuses this geometry.
+static bool from_gguf_mimo2(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = "mimo2.";
+    const auto raw = [&](const std::string& key) -> const strata::MetaValue* { return g.get(p + key); };
+    const auto missing = [&](const std::string& key) { err = "glm5_model: mimo2 key " + key + " missing"; };
+    const auto need = [&](const std::string& key, double& dst) -> bool {
+        const auto* v = raw(key);
+        if (v == nullptr) { missing(key); return false; }
+        if (v->type == strata::MetaType::ARRAY) {
+            if (v->items.empty() || !v->items[0].is_num()) { missing(key); return false; }
+            dst = v->items[0].num();
+            return true;
+        }
+        if (!v->is_num()) { missing(key); return false; }
+        dst = v->num();
+        return true;
+    };
+    const auto need_i = [&](const std::string& key, int& dst) -> bool {
+        double d = 0;
+        if (!need(key, d)) return false;
+        dst = (int) d;
+        return true;
+    };
+    const auto opt = [&](const std::string& key, double def) -> double {
+        const auto* v = raw(key);
+        if (v == nullptr) return def;
+        if (v->type == strata::MetaType::ARRAY)
+            return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+
+    int block_count = 0;
+    if (!need_i("block_count", block_count)) return false;
+    out.nextn = (int) opt("nextn_predict_layers", 0);
+    out.n_layers = block_count - out.nextn;
+    if (out.n_layers < 1) {
+        err = "glm5_model: mimo2 block_count " + std::to_string(block_count) + " - nextn " +
+              std::to_string(out.nextn) + " leaves no trunk";
+        return false;
+    }
+    if (!need_i("embedding_length", out.n_embd)) return false;
+    if (!need_i("attention.head_count", out.n_head)) return false;
+    if (!need_i("attention.head_count_kv", out.n_head_kv_gqa)) return false;   // per-layer array, all equal
+    if (!need_i("attention.key_length", out.head_k)) return false;
+    if (!need_i("attention.value_length", out.head_v)) return false;
+    if (!need_i("rope.dimension_count", out.rope_first)) return false;
+    out.rope_base = (float) opt("rope.freq_base", out.rope_base);
+    out.rope_base_swa = (float) opt("rope.freq_base_swa", out.rope_base_swa);
+    if (!need_i("attention.sliding_window", out.swa_window)) return false;
+    out.v_scale = (float) opt("attention.value_scale", 1.0);
+    if (!need_i("expert_count", out.n_expert)) return false;
+    if (!need_i("expert_used_count", out.n_exp_used)) return false;
+    out.n_ff_exp = (int) opt("expert_feed_forward_length", out.n_ff_exp);
+    out.n_ff_dense = (int) opt("feed_forward_length", out.n_ff_dense);
+    out.norm_eps = (float) opt("attention.layer_norm_rms_epsilon", out.norm_eps);
+    if (const auto* v = raw("vocab_size"))
+        if (v->is_num()) out.n_vocab = (int) v->num();
+
+    // per-layer: kv heads must be uniform (the converter writes one value per block), SWA pattern 0/1
+    {
+        strata::MetaValue v;
+        if (g.get_full(p + "attention.head_count_kv", v) && v.type == strata::MetaType::ARRAY) {
+            for (size_t i = 0; i < v.items.size(); ++i)
+                if (!v.items[i].is_num() || (int) v.items[i].num() != out.n_head_kv_gqa) {
+                    err = "glm5_model: mimo2 attention.head_count_kv is not uniform (entry " + std::to_string(i) + ")";
+                    return false;
+                }
+        }
+        if (!g.get_full(p + "attention.sliding_window_pattern", v) || v.type != strata::MetaType::ARRAY ||
+            v.items.size() < (size_t) out.n_layers) {
+            missing("attention.sliding_window_pattern (array of n_layers)");
+            return false;
+        }
+        out.swa_layer.assign((size_t) out.n_layers, 0);
+        for (int il = 0; il < out.n_layers; ++il) {
+            const auto& it = v.items[(size_t) il];
+            out.swa_layer[(size_t) il] = (it.is_num() ? it.num() != 0 : it.u != 0) ? 1 : 0;
+        }
+    }
+
+    // the vocab is the token table's length (the converter writes no vocab_size key)
+    if (const auto* t = g.find("token_embd.weight"); t != nullptr && t->shape.size() >= 2)
+        out.n_vocab = (int) t->shape[1];
+    // layer 0 is dense in MiMo-V2.6-Pro; no key says so, the tensors do: count the leading blocks that
+    // carry a dense ffn_gate and no router.  A shard without block 0's FFN keeps the arch's value (1).
+    out.dense_lead = 1;
+    if (g.find("blk.0.ffn_gate.weight") != nullptr || g.find("blk.0.ffn_gate_inp.weight") != nullptr) {
+        int d = 0;
+        while (d < out.n_layers && g.find("blk." + std::to_string(d) + ".ffn_gate_inp.weight") == nullptr &&
+               g.find("blk." + std::to_string(d) + ".ffn_gate.weight") != nullptr)
+            ++d;
+        out.dense_lead = d;
+    }
+
+    out.arch = Glm5Geometry::Glm5Arch::Mimo2;
+    out.mhc = false;
+    out.hc = 1;
+    out.n_shared = 0;            // no shared expert
+    out.w_scale = 1.0f;          // routed_scaling_factor null
+    out.norm_w = 1;              // norm_topk_prob
+    out.swiglu_exp = INFINITY;   // plain SwiGLU (no clamp)
+    out.swiglu_shexp = INFINITY;
+    out.n_head_kv.assign((size_t) out.n_layers, 1);   // no KDA layer
+    out.qk_rope = 0;             // MLA fields stay inert
+    out.indexer_full.assign((size_t) out.n_layers, 0);
+
+    if (out.n_head % out.n_head_kv_gqa != 0) {
+        err = "glm5_model: mimo2 head_count " + std::to_string(out.n_head) + " is not a multiple of head_count_kv " +
+              std::to_string(out.n_head_kv_gqa);
+        return false;
+    }
+    if (out.rope_first <= 0 || out.rope_first > out.head_k || out.rope_first % 2 != 0) {
+        err = "glm5_model: mimo2 rope.dimension_count " + std::to_string(out.rope_first) + " not an even 1.." +
+              std::to_string(out.head_k);
+        return false;
+    }
+    if (out.swa_window <= 0) {
+        err = "glm5_model: mimo2 attention.sliding_window must be positive";
+        return false;
+    }
+    return true;
+}
+
 // The forward port is P2: geometry parses, weights do not need to, and the model must stop with a
 // pointer at the plan instead of running Flash arithmetic over Dsa-shaped state.
 static bool dsa_forward_guard(const Glm5Geometry& g, std::string& err) {
+    if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+        if (const char* e = std::getenv("STRATA_MIMO_DEV"); e != nullptr && std::string(e) == "1") return true;
+        err = "glm5_model: mimo2 geometry parsed, but its attention is not ported yet "
+              "(docs/MIMO2-ENGINE-PORT.md); set STRATA_MIMO_DEV=1 for development only";
+        return false;
+    }
     if (g.arch != Glm5Geometry::Glm5Arch::Dsa) return true;
     if (const char* e = std::getenv("STRATA_GLM_DSA_DEV"); e != nullptr && std::string(e) == "1") return true;
     err = "glm5_model: glm-dsa geometry parsed, but the forward path is not ported yet "
@@ -749,6 +972,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
         arch = a->s;
     }
     if (arch == "glm-dsa") return from_gguf_dsa(g, out, err);
+    if (arch == "mimo2") return from_gguf_mimo2(g, out, err);
     if (!arch.empty() && arch != "glm5-next" && arch != "glm5next") {
         err = "glm5_model: unsupported architecture " + arch;
         return false;
@@ -929,6 +1153,7 @@ Glm5Model::~Glm5Model() {
     if (d_tok_) cudaFree(d_tok_);
     if (w_arena_) cudaFree(w_arena_);
     if (mtp_arena_) cudaFree(mtp_arena_);
+    if (mtp_more_arena_) cudaFree(mtp_more_arena_);
     kv_stream_free(kv_);
     if (state_) cudaFree(state_);
     if (sc_) cudaFree(sc_);
@@ -941,10 +1166,21 @@ Glm5Model::~Glm5Model() {
     if (plan_host_) cudaFreeHost(plan_host_);
 }
 
+// Read once for the process's model load (all split parts use the same setting).
+static bool mimo_kv8_wanted() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_MIMO_KV8");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+
 bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string& err) {
     strata::GgufFile gguf(gguf_path);
     if (!Glm5Geometry::from_gguf(gguf, g_, err)) return false;
     if (!dsa_forward_guard(g_, err)) return false;   // glm-dsa parses, P2 ports the forward path
+    mimo_kv8_ = g_.arch == Glm5Geometry::Glm5Arch::Mimo2 && mimo_kv8_wanted();
+    if (mimo_kv8_) { err = "STRATA_MIMO_KV8=1 requires load_pack fast path; F32 reference load is unsupported"; return false; }
     max_ctx_ = max_ctx;
     dev_ = 0;
     l0_ = 0;
@@ -996,6 +1232,13 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;
             kda_conv_[(size_t) il] = floats;
             floats += (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
+        } else if (g_.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+            // mimo2: plain GQA caches, every position (the reference path keeps SWA layers whole too):
+            // K in dsa_lat_ (n_kv x head_k per position), V in dsa_ik_ (n_kv x head_v per position)
+            dsa_lat_[(size_t) il] = floats;
+            floats += (int64_t) g_.kv_row_k() * max_ctx;
+            dsa_ik_[(size_t) il] = floats;
+            floats += (int64_t) g_.kv_row_v() * max_ctx;
         } else if (g_.arch == Glm5Geometry::Glm5Arch::Dsa) {
             // glm-dsa: a cache row is the latent AND its RoPE tail (lat_row = 576); only a full-indexer
             // layer keeps indexer keys (a shared one reuses the previous full layer's selection), and
@@ -1048,13 +1291,15 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
     sc_gated = take(g_.d_inner());
     sc_qr = take(g_.q_lora);
     sc_kv = take(g_.lat_row());                                  // (glm-dsa: kv_a's latent + RoPE tail)
-    sc_q = take((int64_t) g_.n_head * (g_.qk_nope + g_.qk_rope));   // (Flash: qk_rope 0, unchanged)
+    sc_q = take(g_.arch == Glm5Geometry::Glm5Arch::Mimo2
+                    ? (int64_t) g_.n_head * g_.head_k + g_.kv_row_k() + g_.kv_row_v()   // mimo2: fused q|k|v
+                    : (int64_t) g_.n_head * (g_.qk_nope + g_.qk_rope));   // (Flash: qk_rope 0, unchanged)
     sc_qabs = take((int64_t) g_.kv_lora * g_.n_head);
     sc_iq = take((int64_t) g_.idx_heads * g_.idx_key);
     sc_iw = take(g_.idx_heads);
     sc_score = take(max_pools);
     sc_cells = take(g_.n_sel_max());
-    sc_attn = take((int64_t) g_.v_head * g_.n_head);
+    sc_attn = take((int64_t) (g_.arch == Glm5Geometry::Glm5Arch::Mimo2 ? g_.head_v : g_.v_head) * g_.n_head);
     sc_gate = take(ff_max);
     sc_up = take(ff_max);
     sc_h = take(ff_max);
@@ -1674,7 +1919,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         const strata::TensorInfo* tu = findm(P + "ffn_up_exps.weight");
         const strata::TensorInfo* td = findm(P + "ffn_down_exps.weight");
         if ((g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr && tg && tu && td &&
-            mtp_dense_vram(findm, L, b, e2, g.arch == Glm5Geometry::Glm5Arch::Dsa)) {
+            mtp_dense_vram(findm, L, b, e2, g.arch == Glm5Geometry::Glm5Arch::Dsa,
+                           g.arch == Glm5Geometry::Glm5Arch::Mimo2)) {
             blob[(size_t) L] = (tensor_bytes(tg) + tensor_bytes(tu) + tensor_bytes(td)) / g.n_expert;
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
             mtp_dense = (double) b;
@@ -2282,6 +2528,7 @@ bool Glm5Model::forward_pipeline(const std::vector<int32_t>& tokens, std::vector
 
 bool Glm5Model::step_layers(int64_t p, std::string& err) {
     if (g_.arch == Glm5Geometry::Glm5Arch::Dsa) return step_layers_dsa(p, err);
+    if (g_.arch == Glm5Geometry::Glm5Arch::Mimo2) return step_layers_mimo2(p, err);
     const Glm5Geometry& g = g_;
     float* const S = state_;
     float* const A = sc_;
@@ -2538,6 +2785,108 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
 //   - the indexer selects TOKENS (no k-pool): iq/ik rotated on their first qk_rope features, scored over
 //     every visible key, top idx_top_k; a "shared" layer reuses the selection of the previous full layer;
 //   - the SwiGLU is unclamped (the geometry's limits are +inf).
+// ---- mimo2: the reference step (docs/MIMO2-ENGINE-PORT.md) - transformers' MiMoV2DecoderLayer one token at a time:
+// pre-norm GQA attention (fused qkv, NeoX RoPE on the first rope_first dims with the layer type's base, SWA window +
+// sink on SWA layers, V x v_scale), then the FFN half: layer 0 dense, the rest MoE (sigmoid + exp_probs_b top-k,
+// normalised, no shared expert).
+bool Glm5Model::step_layers_mimo2(int64_t p, std::string& err) {
+    if (mimo_kv8_) { err = "STRATA_MIMO_KV8=1: F32 slow attention cannot read INT8 cache"; return false; }
+    const Glm5Geometry& g = g_;
+    float* const S = state_;
+    float* const A = sc_;
+    float* const R = S;
+    const int64_t q_size = (int64_t) g.n_head * g.head_k;
+    const float scale = 1.0f / std::sqrt((float) g.head_k);
+    if (p >= max_ctx_) {
+        err = "glm5_model: mimo2 position " + std::to_string(p) + " past max_ctx " + std::to_string(max_ctx_);
+        return false;
+    }
+    for (int il = l0_; il < l1_; ++il) {
+        const std::string L = std::to_string(il);
+        const auto W = [&](const char* suffix) { return w_.at("blk." + L + "." + suffix); };
+        const auto ws_ = [&](const std::string& suffix) -> WSlot& { return ws_map_.at("blk." + L + "." + suffix); };
+        const bool swa = g.is_swa(il);
+
+        rms_norm_kernel<<<1, GM_THREADS>>>(R, W("attn_norm.weight"), A + sc_x, g.n_embd, 1, g.norm_eps);
+        cb_dump("attn_norm-" + L, A + sc_x, g.n_embd);
+        GM_CHECK(gm_gemv(ws_("attn_qkv.weight"), A + sc_x, nullptr, 1.0f, A + sc_q,
+                         q_size + g.kv_row_k() + g.kv_row_v(), g.n_embd), err);
+        float* q = A + sc_q;
+        float* k = q + q_size;
+        float* v = k + g.kv_row_k();
+        const float base = swa ? g.rope_base_swa : g.rope_base;
+        rope_neox_kernel<<<blocks(g.n_head * (g.rope_first / 2)), GM_THREADS>>>(q, g.n_head, g.head_k, g.rope_first,
+                                                                                (long long) p, base);
+        rope_neox_kernel<<<blocks(g.n_head_kv_gqa * (g.rope_first / 2)), GM_THREADS>>>(k, g.n_head_kv_gqa, g.head_k,
+                                                                                       g.rope_first, (long long) p, base);
+        float* kc = S + dsa_lat_[(size_t) il];
+        float* vc = S + dsa_ik_[(size_t) il];
+        GM_CHECK(cudaMemcpy(kc + (int64_t) g.kv_row_k() * p, k, (size_t) g.kv_row_k() * sizeof(float),
+                            cudaMemcpyDeviceToDevice), err);
+        GM_CHECK(cudaMemcpy(vc + (int64_t) g.kv_row_v() * p, v, (size_t) g.kv_row_v() * sizeof(float),
+                            cudaMemcpyDeviceToDevice), err);
+        const int lo = swa ? (int) std::max<int64_t>(0, p - g.swa_window + 1) : 0;
+        const int n_keys = (int) p - lo + 1;
+        const float* sinks = swa ? W("attn_sinks.weight") : nullptr;
+        gqa_attention_kernel<<<g.n_head, GM_THREADS, (size_t) n_keys * sizeof(float)>>>(
+            q, kc, vc, g.n_head, g.n_head_kv_gqa, g.head_k, g.head_v, lo, (int) p, sinks, scale, g.v_scale,
+            A + sc_attn);
+        GM_CHECK(cudaGetLastError(), err);
+        GM_CHECK(gm_gemv(ws_("attn_output.weight"), A + sc_attn, nullptr, 1.0f, A + sc_mixer, g.n_embd,
+                         (int64_t) g.n_head * g.head_v), err);
+        add_kernel<<<blocks(g.n_embd), GM_THREADS>>>(R, A + sc_mixer, R, g.n_embd);
+        cb_dump("attn_out-" + L, A + sc_mixer, g.n_embd);
+
+        rms_norm_kernel<<<1, GM_THREADS>>>(R, W("ffn_norm.weight"), A + sc_x, g.n_embd, 1, g.norm_eps);
+        if (il < g.dense_lead) {
+            GM_CHECK(gm_gemv(ws_("ffn_gate.weight"), A + sc_x, nullptr, 1.0f, A + sc_gate, g.n_ff_dense, g.n_embd), err);
+            GM_CHECK(gm_gemv(ws_("ffn_up.weight"), A + sc_x, nullptr, 1.0f, A + sc_up, g.n_ff_dense, g.n_embd), err);
+            strata::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_shexp, g.n_ff_dense, A + sc_h, nullptr);
+            GM_CHECK(gm_gemv(ws_("ffn_down.weight"), A + sc_h, nullptr, 1.0f, A + sc_ffn, g.n_embd, g.n_ff_dense), err);
+        } else {
+            GM_CHECK(gm_gemv(ws_("ffn_gate_inp.weight"), A + sc_x, nullptr, 1.0f, A + sc_tmp, g.n_expert, g.n_embd), err);
+            strata::kernels::router_sigmoid(A + sc_tmp, W("exp_probs_b.bias"), 1, g.n_expert, g.n_exp_used,
+                                            g.w_scale, g.norm_w != 0, (int*) (A + sc_ids), A + sc_rw, nullptr);
+            std::vector<int> ids((size_t) g.n_exp_used);
+            std::vector<float> rw((size_t) g.n_exp_used);
+            GM_CHECK(cudaMemcpy(ids.data(), A + sc_ids, ids.size() * sizeof(int), cudaMemcpyDeviceToHost), err);
+            GM_CHECK(cudaMemcpy(rw.data(), A + sc_rw, rw.size() * sizeof(float), cudaMemcpyDeviceToHost), err);
+            GM_CHECK(cudaMemset(A + sc_moe, 0, (size_t) g.n_embd * sizeof(float)), err);
+            const int64_t slab = (int64_t) g.n_embd * g.n_ff_exp;
+            if (pack_) {   // quantized experts: the pack's own routed tail (CPU native_expert or the device pool)
+                if (dev_experts_) {
+                    if (!pack_moe_tail_device(err, ids, rw, A, il)) return false;
+                } else {
+                    GM_CHECK(pack_moe_tail(err, ids, rw, A, il), err);
+                }
+            } else for (int i = 0; i < g.n_exp_used; ++i) {
+                const int e = ids[(size_t) i];
+                gemv_bias_kernel<<<gm_blocks(g.n_ff_exp), GM_THREADS>>>(W("ffn_gate_exps.weight") + slab * e,
+                                                                     A + sc_x, nullptr, 1.0f, A + sc_gate,
+                                                                     g.n_ff_exp, g.n_embd, 1);
+                gemv_bias_kernel<<<gm_blocks(g.n_ff_exp), GM_THREADS>>>(W("ffn_up_exps.weight") + slab * e,
+                                                                     A + sc_x, nullptr, 1.0f, A + sc_up,
+                                                                     g.n_ff_exp, g.n_embd, 1);
+                strata::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_exp, g.n_ff_exp, A + sc_h, nullptr);
+                gemv_bias_kernel<<<gm_blocks(g.n_embd), GM_THREADS>>>(W("ffn_down_exps.weight") + slab * e,
+                                                                   A + sc_h, nullptr, 1.0f, A + sc_dn, g.n_embd,
+                                                                   g.n_ff_exp, 1);
+                axpy_kernel<<<blocks(g.n_embd), GM_THREADS>>>(A + sc_moe, rw[(size_t) i], A + sc_dn, g.n_embd);
+            }
+            GM_CHECK(cudaMemcpy(A + sc_ffn, A + sc_moe, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice),
+                     err);   // no shared expert
+        }
+        add_kernel<<<blocks(g.n_embd), GM_THREADS>>>(R, A + sc_ffn, R, g.n_embd);
+        cb_dump("l_out-" + L, R, g.n_embd);
+    }
+    if (l1_ == g.n_layers) {
+        rms_norm_kernel<<<1, GM_THREADS>>>(R, w_.at("output_norm.weight"), A + sc_head, g.n_embd, 1, g.norm_eps);
+        GM_CHECK(gm_gemv(ws_map_.at("output.weight"), A + sc_head, nullptr, 1.0f, A + sc_logits, g.n_vocab, g.n_embd),
+                 err);
+    }
+    return true;
+}
+
 bool Glm5Model::step_layers_dsa(int64_t p, std::string& err) {
     const Glm5Geometry& g = g_;
     float* const S = state_;
@@ -3261,6 +3610,15 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // so this is lossless; F32 expansion doubled their bytes and their read time) and does not upload
     // token_embd at all (the embedding row is dequantized on the host from the shard mapping)
     fast_mode_ = getenv("STRATA_GLM_SLOW") == nullptr;
+    mimo_kv8_ = g_.arch == Glm5Geometry::Glm5Arch::Mimo2 && mimo_kv8_wanted();
+    if (mimo_kv8_ && (!fast_mode_ || g_.head_k != 192 || g_.head_v != 128)) {
+        err = "STRATA_MIMO_KV8=1 requires the fast mimo2 192/128 path (unset STRATA_GLM_SLOW)";
+        return false;
+    }
+    if (mimo_kv8_ && getenv("STRATA_MIMO_ATTN_SMEM")) {
+        err = "STRATA_MIMO_KV8=1 does not support STRATA_MIMO_ATTN_SMEM; unset it";
+        return false;
+    }
     if (exl3_ && !fast_mode_) {
         err = "pack: an EXL3 model runs on the fast path only (unset STRATA_GLM_SLOW)";
         return false;
@@ -3274,7 +3632,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         // small model's fall under the 65536 floor, a real one's do not)
         return fast_mode_ && r.kind == "4" &&
                (t->elements() >= 65536 ||
-                (g_.arch == Glm5Geometry::Glm5Arch::Dsa &&
+                ((g_.arch == Glm5Geometry::Glm5Arch::Dsa || g_.arch == Glm5Geometry::Glm5Arch::Mimo2) &&
                  (ends(r.name, "ffn_gate_inp.weight") || ends(r.name, "indexer.proj.weight"))));
     };
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
@@ -3556,17 +3914,27 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
                               strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it)
-    kda_S_.assign((size_t) g_.n_layers + 1, 0);
-    kda_conv_.assign((size_t) g_.n_layers + 1, 0);
-    dsa_lat_.assign((size_t) g_.n_layers + 1, 0);
-    dsa_ik_.assign((size_t) g_.n_layers + 1, 0);
-    dsa_ig_.assign((size_t) g_.n_layers + 1, 0);
-    dsa_pool_.assign((size_t) g_.n_layers + 1, 0);
+    kda_S_.assign((size_t) g_.n_layers + 1 + mtp_more_, 0);
+    kda_conv_.assign((size_t) g_.n_layers + 1 + mtp_more_, 0);
+    dsa_lat_.assign((size_t) g_.n_layers + 1 + mtp_more_, 0);
+    dsa_ik_.assign((size_t) g_.n_layers + 1 + mtp_more_, 0);
+    dsa_ig_.assign((size_t) g_.n_layers + 1 + mtp_more_, 0);
+    dsa_pool_.assign((size_t) g_.n_layers + 1 + mtp_more_, 0);
     // the indexer key / gate caches: a ring on the fast path (the prompt path's largest sub-batch + 64 positions; see
     // ik_ring_), the whole context on the reference path (whose kernels index them by position)
     ik_ring_ = fast_mode_ ? (int) std::min<int64_t>(max_ctx, 8192 + 64) : (int) max_ctx;
     if (dsa53) ik_ring_ = (int) max_ctx;   // glm-dsa: no pool to fold the keys into - the indexer reads every one
-    if (mtp_il_ >= 0) {
+    if (mtp_il_ >= 0 && g_.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+        // the MTP block attends like a SWA layer: its K/V ring (FP16 on the token path, F32 on the reference path)
+        const int64_t rows = fast_mode_ ? std::min<int64_t>(max_ctx, g_.swa_ring()) : max_ctx;
+        const int64_t div = fast_mode_ ? 2 : 1;
+        for (int k = 0; k <= mtp_more_; ++k) {   // block 0, and the native decode's blocks 1 .. mtp_more_
+            dsa_lat_[(size_t) mtp_il_ + k] = floats;
+            floats += ((int64_t) g_.kv_row_k() * rows + div - 1) / div;
+            dsa_ik_[(size_t) mtp_il_ + k] = floats;
+            floats += ((int64_t) g_.kv_row_v() * rows + div - 1) / div;
+        }
+    } else if (mtp_il_ >= 0) {
         dsa_lat_[(size_t) mtp_il_] = floats;
         floats += lat_floats;
         dsa_ik_[(size_t) mtp_il_] = floats;
@@ -3583,6 +3951,22 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;
             kda_conv_[(size_t) il] = floats;
             floats += (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
+        } else if (g_.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+            // mimo2: plain GQA caches.  The reference path: F32, every position.  The token path: FP16 (half the floats),
+            // and a SWA layer only its ring (swa_ring rows, position p at row p % ring) - 60 of 70 layers see 128 keys
+            const int64_t rows = fast_mode_ && g_.is_swa(il) ? std::min<int64_t>(max_ctx, g_.swa_ring()) : max_ctx;
+            const int64_t div = fast_mode_ ? 2 : 1;
+            if (mimo_kv8_layer(il)) {
+                const MimoKv8Layout kv(floats, rows, g_.n_head_kv_gqa, g_.head_k, g_.head_v);
+                dsa_lat_[(size_t)il]=kv.k; dsa_ig_[(size_t)il]=kv.ks;
+                dsa_ik_[(size_t)il]=kv.v; dsa_pool_[(size_t)il]=kv.vs;
+                floats=kv.end;
+            } else {
+            dsa_lat_[(size_t) il] = floats;
+            floats += ((int64_t) g_.kv_row_k() * rows + div - 1) / div;
+            dsa_ik_[(size_t) il] = floats;
+            floats += ((int64_t) g_.kv_row_v() * rows + div - 1) / div;
+            }
         } else if (dsa53) {
             // glm-dsa: the cache rows (latent + k_rope); keys only where the layer runs its own indexer; no pool
             dsa_lat_[(size_t) il] = floats;
@@ -3634,13 +4018,15 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     sc_gated = take(g_.d_inner());
     sc_qr = take(g_.q_lora);
     sc_kv = take(g_.lat_row());                                  // (glm-dsa: kv_a's latent + RoPE tail)
-    sc_q = take((int64_t) g_.n_head * (g_.qk_nope + g_.qk_rope));   // (Flash: qk_rope 0, unchanged)
+    sc_q = take(g_.arch == Glm5Geometry::Glm5Arch::Mimo2
+                    ? (int64_t) g_.n_head * g_.head_k + g_.kv_row_k() + g_.kv_row_v()   // mimo2: fused q|k|v
+                    : (int64_t) g_.n_head * (g_.qk_nope + g_.qk_rope));   // (Flash: qk_rope 0, unchanged)
     sc_qabs = take((int64_t) g_.kv_lora * g_.n_head);
     sc_iq = take((int64_t) g_.idx_heads * g_.idx_key);
     sc_iw = take(g_.idx_heads);
     sc_score = take(max_pools);
     sc_cells = take(g_.n_sel_max());
-    sc_attn = take((int64_t) g_.v_head * g_.n_head);
+    sc_attn = take((int64_t) (g_.arch == Glm5Geometry::Glm5Arch::Mimo2 ? g_.head_v : g_.v_head) * g_.n_head);
     sc_gate = take(ff_max);
     sc_up = take(ff_max);
     sc_h = take(ff_max);
@@ -3810,6 +4196,83 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
 // state)].  The pack never carried it, so its tensors come straight from the shards: the quantized projections stay
 // quantized, the small rows the trunk's kernels expect as BF16 (indexer, router, absorbed k/v) are widened at load,
 // and its routed experts join the expert tiers as one more MoE layer (pack_layers_[n_layers]).
+// mimo2's MTP blocks 1 .. nextn - 1 (STRATA_MIMO_MTP3): blk.<n_layers + k> as load_mtp keeps block 0 - the quantized
+// matrices as they are, the norms and sinks in F32 - in one arena; mtp_more_ = how many.  A block that is not in the
+// GGUF ends the list there (the native decode then drafts that many depths).
+bool strata::core::Glm5Model::load_mtp_more(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs, std::string& err) {
+    const MtpNames nm = mtp_names(true);
+    const auto find = [&](const std::string& n, int& si) -> const strata::TensorInfo* {
+        for (size_t i = 0; i < gfs.size(); ++i)
+            if (const strata::TensorInfo* t = gfs[i]->find(n)) {
+                si = (int) i;
+                return t;
+            }
+        si = -1;
+        return nullptr;
+    };
+    const int n_more = std::min(2, g_.nextn - 1);
+    int have = 0;
+    uint64_t bytes = 0;
+    for (int k = 1; k <= n_more; ++k) {
+        uint64_t b = 0;
+        std::string e2;
+        int si = -1;
+        if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, g_.n_layers + k, b, e2, false, true)) break;
+        bytes += b;
+        have = k;
+    }
+    if (have == 0) {
+        std::fprintf(stderr, "glm mtp: CUDA%d STRATA_MIMO_MTP3: no MTP block past blk.%d in the GGUF - block 0 only\n", dev_,
+                     g_.n_layers);
+        return true;
+    }
+    if (cudaMalloc(&mtp_more_arena_, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        mtp_more_arena_ = nullptr;
+        std::fprintf(stderr, "glm mtp: CUDA%d STRATA_MIMO_MTP3: the MTP blocks 1..%d (%.0f MB) did not allocate - block 0 only\n",
+                     dev_, have, (double) bytes / 1048576.0);
+        return true;
+    }
+    uint8_t* base = (uint8_t*) mtp_more_arena_;
+    uint64_t at = 0;
+    std::vector<float> host;
+    for (int k = 1; k <= have; ++k) {
+        const std::string P = "blk." + std::to_string(g_.n_layers + k) + ".";
+        int si = -1;
+        for (const char* n : nm.raw) {
+            const strata::TensorInfo* t = find(P + n, si);
+            const size_t nb = strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]);
+            const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + t->offset;
+            if (cudaMemcpy(base + at, src, nb, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
+            ws_map_[P + n] = strata::core::WSlot{nullptr, (int) t->type, (const void*) (base + at), (int64_t) t->shape[0],
+                                                 (int64_t) t->shape[1]};
+            at += (nb + 255u) & ~(uint64_t) 255u;
+        }
+        for (const char* n : nm.f32) {
+            const strata::TensorInfo* t = find(P + n, si);
+            const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + t->offset;
+            if (t->type == 0) {
+                host.resize((size_t) t->elements());
+                std::memcpy(host.data(), src, (size_t) t->elements() * 4);
+            } else if (!pack_dequant_tensor(*t, src, host, err)) {
+                return false;
+            }
+            if (cudaMemcpy(base + at, host.data(), host.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "mtp: upload";
+                return false;
+            }
+            w_[P + n] = (const float*) (base + at);
+            ws_map_[P + n] = strata::core::WSlot{(const float*) (base + at), 0, nullptr, 0, 0};
+            at += ((uint64_t) host.size() * 4 + 255u) & ~(uint64_t) 255u;
+        }
+    }
+    mtp_more_ = have;
+    mtp_arena_bytes_ += bytes;
+    std::fprintf(stderr, "glm mtp: CUDA%d STRATA_MIMO_MTP3: MTP blocks 1..%d (blk.%d..%d) loaded too: %.0f MB - native drafting\n",
+                 dev_, have, g_.n_layers + 1, g_.n_layers + have, (double) bytes / 1048576.0);
+    return true;
+}
+
 bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs, std::string& err) {
     const int il = g_.n_layers;
     const std::string P = "blk." + std::to_string(il) + ".";
@@ -3841,10 +4304,12 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         return true;   // a GGUF without the draft block
     }
     const auto x3 = [&](const std::string& n) { return exl3_ && xt.mats.count(n) != 0; };
-    const auto& raw_names = kMtpRaw;
     const bool dsa53 = g_.arch == Glm5Geometry::Glm5Arch::Dsa;
-    const auto& b16_names = kMtpB16;
-    const auto& f32_names = kMtpF32;
+    const bool mimo = g_.arch == Glm5Geometry::Glm5Arch::Mimo2;
+    const MtpNames mtp_nm = mtp_names(mimo);
+    const auto& raw_names = mtp_nm.raw;
+    const auto& b16_names = mtp_nm.b16;
+    const auto& f32_names = mtp_nm.f32;
     uint64_t bytes = 0;
     if (exl3_) {
         for (const char* n : raw_names) {
@@ -3865,7 +4330,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
         }
     } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err,
-                               g_.arch == Glm5Geometry::Glm5Arch::Dsa)) {
+                               g_.arch == Glm5Geometry::Glm5Arch::Dsa, g_.arch == Glm5Geometry::Glm5Arch::Mimo2)) {
         return false;
     }
     if (cudaMalloc(&mtp_arena_, bytes) != cudaSuccess) {
@@ -3957,6 +4422,20 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         w_[P + n] = (const float*) (base + at);
         ws_map_[P + n] = strata::core::WSlot{(const float*) (base + at), 0, nullptr, 0, 0};
         at += ((uint64_t) host.size() * 4 + 255u) & ~(uint64_t) 255u;
+    }
+    if (mimo) {   // a dense MLP: no routed experts to map; the draft embeds the next token from the shard mapping
+        if (pack_emb_src_ == nullptr) {
+            int se = -1;
+            const strata::TensorInfo* te = find("token_embd.weight", se);
+            if (te == nullptr) { err = "mtp: token_embd not found"; return false; }
+            pack_emb_src_ = pack_shards_[(size_t) se].base + gfs[(size_t) se]->data_start() + te->offset;
+            pack_emb_type_ = (int) te->type;
+        }
+        mtp_il_ = il;
+        std::fprintf(stderr, "glm mtp: CUDA%d the mimo2 MTP block (blk.%d) loaded: %.0f MB dense (SWA attention + dense MLP)\n",
+                     dev_, il, (double) bytes / 1048576.0);
+        if (getenv("STRATA_MIMO_MTP3") != nullptr && g_.nextn > 1 && !load_mtp_more(gfs, err)) return false;
+        return true;
     }
     // the routed experts: gate/up/down by absolute offset, like native_experts.txt rows
     NativeLayer nl;

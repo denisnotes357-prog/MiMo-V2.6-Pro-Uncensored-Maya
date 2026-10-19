@@ -24,6 +24,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_batch.hpp"
+#include "strata/kernels/mimo_prefill.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #if defined(STRATA_USE_HIP)
 #include "strata/prefill/gemm.hpp"
@@ -167,6 +168,13 @@ MlaAttnPath mla_attn_path() {
     return gb::mla_wmma2_default() ? MlaAttnPath::WMMA2 : MlaAttnPath::F16Q;
 }
 #endif
+struct MimoBufs { float *qkv, *attn; uint16_t* attn16; };
+MimoBufs carve_mimo(Carve& c, size_t T, const Glm5Geometry& g) {
+    const size_t nqkv = (size_t) g.n_head * g.head_k + g.kv_row_k() + g.kv_row_v();
+    const size_t ao = (size_t) g.n_head * g.head_v;
+    return {c.take<float>(T * nqkv), c.take<float>(T * ao), c.take<uint16_t>(T * ao)};
+}
+
 struct DsaBufs {
     float *qr_raw, *qr, *kv_raw, *ik_raw, *ig_raw, *iw, *q, *iq, *score, *q_abs, *ctx, *attn;
     uint16_t *qr16, *attn16;
@@ -290,7 +298,9 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
     for (int t2 = 2 * kSub; t2 <= 4096 && (size_t) t2 <= T; t2 *= 2) {
         size_t need = 0;
         if (kda) { Carve k; carve_kda(k, (size_t) t2, g); need = std::max(need, k.off); }
-        if (dsa) { Carve d; carve_dsa(d, (size_t) t2, g, max_pools); need = std::max(need, d.off); }
+        if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+            Carve m; carve_mimo(m, (size_t) t2, g); need = std::max(need, m.off);
+        } else if (dsa) { Carve d; carve_dsa(d, (size_t) t2, g, max_pools); need = std::max(need, d.off); }
         if (dense) { Carve d; carve_dense(d, (size_t) t2, g); need = std::max(need, d.off); }
         if (need > room) break;
         ts = t2;
@@ -526,11 +536,12 @@ void Glm5Model::prefill_settle(double pinned_share) {
 static std::pair<int64_t, int64_t> weight_scratch(const Glm5Geometry& g, bool has_dsa) {
     const int64_t E = g.n_embd;
     int64_t w32 = 2 << 20;
-    if (has_dsa)
+    if (has_dsa && g.arch != Glm5Geometry::Glm5Arch::Mimo2)
         w32 = std::max<int64_t>({w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
-    int64_t w16 = std::max<int64_t>((int64_t) g.d_inner() * E, (int64_t) 2048 * E);
+    int64_t w16 = g.arch == Glm5Geometry::Glm5Arch::Mimo2 ? 2048 * E
+        : std::max<int64_t>((int64_t) g.d_inner() * E, (int64_t) 2048 * E);
 #if defined(STRATA_USE_HIP)
-    if (has_dsa)   // the MLA products' FP16 copy of wk_b / wv_b
+    if (has_dsa && g.arch != Glm5Geometry::Glm5Arch::Mimo2)   // the MLA products' FP16 copy of wk_b / wv_b
         w16 = std::max<int64_t>({w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
 #endif
     return {w16, w32};
@@ -566,6 +577,8 @@ bool Glm5Model::prefill_setup(std::string& err) {
             deq_ok(Ly.q, "attn_q", il);
             deq_ok(Ly.k, "attn_k", il);
             deq_ok(Ly.v, "attn_v", il);
+        } else if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+            deq_ok(Ly.q, "attn_qkv", il);
         } else {
             has_dsa = true;
             deq_ok(Ly.q_a, "attn_q_a", il);
@@ -576,9 +589,11 @@ bool Glm5Model::prefill_setup(std::string& err) {
         deq_ok(Ly.out, "attn_output", il);
         if (Ly.moe) {
             has_moe = true;
-            deq_ok(Ly.sh_gate, "ffn_gate_shexp", il);
-            deq_ok(Ly.sh_up, "ffn_up_shexp", il);
-            deq_ok(Ly.sh_down, "ffn_down_shexp", il);
+            if (g.n_shared > 0) {
+                deq_ok(Ly.sh_gate, "ffn_gate_shexp", il);
+                deq_ok(Ly.sh_up, "ffn_up_shexp", il);
+                deq_ok(Ly.sh_down, "ffn_down_shexp", il);
+            }
             if (!Ly.exl3 && (!mmq::supported(Ly.gu_type) || !mmq::supported(Ly.d_type)))   // (EXL3: run_set_x3)
                 why += "blk." + std::to_string(il) + " experts (types " + std::to_string(Ly.gu_type) + "/" +
                        std::to_string(Ly.d_type) + ") ";
@@ -590,6 +605,11 @@ bool Glm5Model::prefill_setup(std::string& err) {
             deq_ok(Ly.ffn_down, "ffn_down", il);
         }
     }
+    if (g.arch == Glm5Geometry::Glm5Arch::Mimo2 &&
+        (g.head_k <= 0 || g.head_k > 256 || g.head_k % 32 || g.head_v <= 0 || g.head_v > 256 ||
+         g.head_v % 32 || g.n_head_kv_gqa <= 0 || g.n_head % g.n_head_kv_gqa ||
+         g.rope_first <= 0 || g.rope_first % 2 || g.rope_first > g.head_k))
+        why += "unsupported mimo2 attention geometry ";
     if (!why.empty()) {
         std::fprintf(stderr, "glm prefill: CUDA%d has no prompt path (not covered: %s) - token by token\n", dev_,
                      why.substr(0, 400).c_str());
@@ -928,11 +948,18 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     size_t uni = 0;
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
-    if (has_dsa) { Carve d; carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
+    if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+        Carve m; carve_mimo(m, ts, g); uni = std::max(uni, m.off);
+    } else if (has_dsa) { Carve d; carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
     if (has_moe) { Carve m; carve_moe(m, T, (size_t) (sub_env > 0 ? sub_env : kSub), g); uni = std::max(uni, m.off); }
     // the NextN block's cache fill (the last half) carves 4 n_embd + 1.5 n_embd rows of its own
-    if (mtp) uni = std::max(uni, T * (size_t) (6 * g.n_embd + g.kv_lora + 2 * g.idx_key) * 4 + 8 * 256);
+    if (mtp) {
+        const size_t extra = g.arch == Glm5Geometry::Glm5Arch::Mimo2
+            ? (size_t) g.n_head * g.head_k + g.kv_row_k() + g.kv_row_v()
+            : (size_t) g.kv_lora + 2 * g.idx_key;
+        uni = std::max(uni, T * ((size_t) 6 * g.n_embd + extra) * 4 + 8 * 256);
+    }
     return {a.off, uni};
 }
 
@@ -1263,6 +1290,11 @@ bool Glm5Model::prefill_return(std::string& err) {
             if (P.st[(size_t) s] == FastState::kLent) P.st[(size_t) s] = FastState::kFree;
     }
     S->lent = false;
+    if (S->prof) {
+        std::fprintf(stderr, "glm prefill phase totals CUDA%d:", dev_);
+        for (const auto& kv : S->pacc) std::fprintf(stderr, " %s=%.1fms", kv.first.c_str(), kv.second);
+        std::fprintf(stderr, "\n");
+    }
     return true;
 }
 
@@ -1803,6 +1835,41 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                             state_ + kda_S_[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
                 S->mark("kda_rec", s);
                 if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
+            } else if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+                Carve c{S->uni};
+                MimoBufs B = carve_mimo(c, (size_t) tn, g);
+                const int nqkv = g.n_head * g.head_k + g.kv_row_k() + g.kv_row_v();
+                const int ao = g.n_head * g.head_v;
+                const bool swa = g.is_swa(il);
+                const int ring = swa ? (int) std::min<int64_t>(max_ctx_, g.swa_ring()) : (int) max_ctx_;
+                const strata::kernels::MimoPrefillArgs a{g.n_head, g.n_head_kv_gqa, g.head_k, g.head_v,
+                    g.rope_first, ring, swa ? g.swa_window : 0, swa ? g.rope_base_swa : g.rope_base, g.v_scale};
+                auto* kc = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+                auto* vc = (uint16_t*) (state_ + dsa_ik_[(size_t) il]);
+                hgemm_q(Ly.q, nqkv, E, x16, E, B.qkv, nqkv, tn, 0.0f);
+                S->mark("mimo_qkv", s);
+                // Only cache/attention is sub-tiled: the projections keep their large GEMMs.
+                // At most ring-window+1 rows may be written ahead of the earliest query.
+                const int step = swa ? std::max(1, ring - std::min(ring, g.swa_window) + 1) : tn;
+                for (int u = 0; u < tn; u += step) {
+                    const int n = std::min(step, tn - u);
+                    float* qkv = B.qkv + (size_t) u * nqkv;
+                    if (mimo_kv8_layer(il)) {
+                        float* ks=state_+dsa_ig_[(size_t)il];
+                        float* vs=state_+dsa_pool_[(size_t)il];
+                        strata::kernels::mimo_prefill_rope_kv8(qkv,(int8_t*)kc,(int8_t*)vc,ks,vs,(int)p0+t0+u,n,a,s);
+                        strata::kernels::mimo_prefill_attention_kv8(qkv,(const int8_t*)kc,(const int8_t*)vc,ks,vs,nullptr,
+                            B.attn+(size_t)u*ao,(int)p0+t0+u,n,a,s,getenv("STRATA_MIMO_PREFILL_SCALAR")!=nullptr);
+                    } else {
+                    strata::kernels::mimo_prefill_rope_kv(qkv, kc, vc, (int) p0 + t0 + u, n, a, s);
+                    strata::kernels::mimo_prefill_attention(qkv, kc, vc, swa ? Ly.sinks : nullptr,
+                        B.attn + (size_t) u * ao, (int) p0 + t0 + u, n, a, s,
+                        getenv("STRATA_MIMO_PREFILL_SCALAR") != nullptr);
+                    }
+                }
+                S->mark("mimo_attn", s);
+                gb::f32_to_f16(B.attn, B.attn16, (int64_t) tn * ao, s);
+                if (!skip_output) hgemm_q(Ly.out, E, ao, B.attn16, ao, mixer, E, tn, 0.0f);
             } else if (g.arch == Glm5Geometry::Glm5Arch::Dsa) {
                 // glm-dsa (docs/GLM53-ENGINE-PORT.md P4): fast_dsa53 for a sub-batch of rows
                 Carve c{S->uni};
@@ -2073,7 +2140,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         Carve c{S->uni};
         MoeBufs M = carve_moe(c, (size_t) T, (size_t) S->sh_sub(), g);
         const int FF = g.n_ff_exp * g.n_shared, NE = g.n_expert, nff = g.n_ff_exp;
-        for (int t0 = 0, shs = S->sh_sub(); t0 < T; t0 += shs) {
+        if (FF == 0) cudaMemsetAsync(S->ffn, 0, (size_t) T * E * sizeof(float), s);
+        for (int t0 = 0, shs = S->sh_sub(); FF > 0 && t0 < T; t0 += shs) {
             const int tn = std::min(shs, T - t0);
             const uint16_t* x16 = S->x16 + (size_t) t0 * E;
             hgemm_q(Ly.sh_gate, FF, E, x16, E, M.sh_g, FF, tn, 0.0f);
@@ -3006,6 +3074,48 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 else
                     tt->to_float(pack_emb_src_ + (size_t) next_ids[t] * row_b, S->emb_h + (size_t) t * E, E);
             }
+            if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+                Carve c{S->uni};
+                float* h = c.take<float>((size_t) Tv * E);
+                float* emb = c.take<float>((size_t) Tv * E);
+                uint16_t* cat16 = c.take<uint16_t>((size_t) Tv * 2 * E);
+                float* hid = c.take<float>((size_t) Tv * E);
+                const int nqkv = g.n_head * g.head_k + g.kv_row_k() + g.kv_row_v();
+                float* qkv = c.take<float>((size_t) Tv * nqkv);
+                cudaMemcpyAsync(emb, S->emb_h, (size_t) Tv * E * sizeof(float), cudaMemcpyHostToDevice, s);
+                gb::rms_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, S->x16, s);
+                gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, Tv, E, cat16, s);
+                hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, Tv, 0.0f);
+                gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, Tv, E, S->x, S->x16, s);
+                hgemm_q(Ly.q, nqkv, E, S->x16, E, qkv, nqkv, Tv, 0.0f);
+                const int ring = (int) std::min<int64_t>(max_ctx_, g.swa_ring());
+                const strata::kernels::MimoPrefillArgs a{g.n_head, g.n_head_kv_gqa, g.head_k, g.head_v,
+                    g.rope_first, ring, g.swa_window, g.rope_base_swa, g.v_scale};
+                // No attention here: only the final ring rows survive. Unique destinations avoid races.
+                const int start = std::max(0, Tv - ring);
+                strata::kernels::mimo_prefill_rope_kv(qkv + (size_t) start * nqkv,
+                    (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]),
+                    (uint16_t*) (state_ + dsa_ik_[(size_t) mtp_il_]), (int) p0 + start, Tv - start, a, s);
+                // the native decode's blocks 1 .. mtp_more_ (STRATA_MIMO_MTP3): block k's entry for position p reads
+                // h_p and the token at p + 1 + k - the same embedding rows k further on; the chunk's last k rows wait
+                // for the decode's fill
+                for (int k = 1; k <= mtp_more_; ++k) {
+                    const int Tk = Tv - k;
+                    if (Tk <= 0) break;
+                    const auto& Lk = F->L[(size_t) mtp_il_ + k];
+                    gb::mtp_in_rows(emb + (size_t) k * E, h, Lk.enorm, Lk.hnorm, g.norm_eps, Tk, E, cat16, s);
+                    hgemm_q(Lk.eh, E, 2 * E, cat16, 2 * E, hid, E, Tk, 0.0f);
+                    gb::rms_rows(hid, Lk.attn_norm, g.norm_eps, Tk, E, S->x, S->x16, s);
+                    hgemm_q(Lk.q, nqkv, E, S->x16, E, qkv, nqkv, Tk, 0.0f);
+                    const int sk = std::max(0, Tk - ring);
+                    strata::kernels::mimo_prefill_rope_kv(qkv + (size_t) sk * nqkv,
+                        (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_ + k]),
+                        (uint16_t*) (state_ + dsa_ik_[(size_t) mtp_il_ + k]), (int) p0 + sk, Tk - sk, a, s);
+                }
+                S->mark("mtp_cache", s);
+                S->collect();
+                return glmfast::cuda_ok(cudaGetLastError(), "mimo prefill", err);
+            }
             if (g.arch == Glm5Geometry::Glm5Arch::Dsa) {
                 // glm-dsa: rms(R) is the head's input (one stream), the cache row [latent | rotated k_rope] and the
                 // rotated indexer key - the NextN block's own indexer is a full one
@@ -3393,7 +3503,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             Glm5Model* prev = this;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
                 PrefillState* SP = prev->pf_;
-                const size_t hop = (size_t) T * 4 * E * sizeof(float);
+                const size_t hop = (size_t) T * g.hc * E * sizeof(float);
                 cudaSetDevice(prev->dev_);
                 cudaMemcpyAsync(SP->hop_h, SP->R, hop, cudaMemcpyDeviceToHost, prev->fast_->cs);
                 cudaEventRecord(SP->ev_hop, prev->fast_->cs);
@@ -3427,7 +3537,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
         bool stop = false;
         std::string stage_err;
-        const size_t slot = (size_t) Tc * 4 * E;
+        const size_t slot = (size_t) Tc * g.hc * E;
         const auto fail = [&](std::string e) {
             std::lock_guard<std::mutex> lk(mu);
             if (stage_err.empty()) stage_err = std::move(e);
@@ -3442,7 +3552,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 cv.wait(lk, [&] { return consumed[(size_t) k] >= c - 1 || stop; });
                 if (stop) return false;
             }
-            cudaMemcpyAsync(m->pf_->hop_h + (size_t) (c & 1) * slot, m->pf_->R, (size_t) T * 4 * E * sizeof(float),
+            cudaMemcpyAsync(m->pf_->hop_h + (size_t) (c & 1) * slot, m->pf_->R, (size_t) T * g.hc * E * sizeof(float),
                             cudaMemcpyDeviceToHost, m->fast_->cs);
             std::string e;
             if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop out", e)) {
@@ -3471,7 +3581,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     const int T = chunk_len(c);
                     const int64_t p0 = pos_start + (int64_t) c * Tc;
                     cudaMemcpyAsync(m->pf_->R, up->pf_->hop_h + (size_t) (c & 1) * slot,
-                                    (size_t) T * 4 * E * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
+                                    (size_t) T * g.hc * E * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
                     std::string e2;
                     if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop in", e2)) {
                         fail(e2);

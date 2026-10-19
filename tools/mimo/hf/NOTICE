@@ -1,0 +1,8 @@
+Files from the MiMo-V2 checkpoint (https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD), Copyright 2026 Xiaomi Corporation
+and The HuggingFace Inc. team, licensed under the Apache License 2.0 (LICENSES/Apache-2.0.txt).
+
+Modified for standalone loading by tools/mimo/mimo_vision.py:
+- modeling_mimo_v2.py: `from .configuration_mimo_v2 import` -> `from configuration_mimo_v2 import` (absolute import);
+  the attention-mask call passes `inputs_embeds` (was `input_embeds`) and no `cache_position` (current transformers).
+- configuration_mimo_v2.py: unchanged.
+Only the vision classes (MiMoVisionTransformer and its parts) are used by Maya.

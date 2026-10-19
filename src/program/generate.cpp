@@ -1192,7 +1192,10 @@ static int glm_pack_generate(const Options& o) {
     uint64_t slot_clock = 0, slot_seq = 0;
     bool snap_in_slot = false;   // the model's snapshot is one of the slots, unchanged since
     const auto env_num = [](const char* k, double d) { const char* v = getenv(k); return v ? std::atof(v) : d; };
-    int slot_max = model.fast() && getenv("STRATA_GLM_NO_REUSE") == nullptr ? (int) env_num("STRATA_GLM_SLOTS", 4) : 0;
+    // (mimo2: the slots below copy the DSA caches and indexer pool, which it has none of - off; its snapshot and its
+    // checkpoints hold the SWA rings - the full layers' caches are positional and stay put)
+    const bool mimo2 = model.geometry().arch == strata::core::Glm5Geometry::Glm5Arch::Mimo2;
+    int slot_max = model.fast() && !mimo2 && getenv("STRATA_GLM_NO_REUSE") == nullptr ? (int) env_num("STRATA_GLM_SLOTS", 4) : 0;
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_GLM_SLOT_MIN", 1024));
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_GLM_SLOT_GB", 16) * 1073741824.0);
     // STRATA_GLM_SLOT_KEEP=1: the slots outlive the engine - the folder is not emptied at start (its files are indexed
@@ -1449,7 +1452,9 @@ static int glm_pack_generate(const Options& o) {
     const int ckpt_max = model.fast() && model.seq_count() <= 1 && getenv("STRATA_GLM_NO_REUSE") == nullptr
                              ? std::max(0, std::min(16, (int) env_num("STRATA_GLM_CKPTS", 4)))
                              : 0;
-    const int64_t ckpt_every = std::max<int64_t>(0, (int64_t) env_num("STRATA_GLM_CKPT_EVERY", 16384));
+    // (mimo2: no periodic marks by default - every mark ends a prompt-path call, and a split pipeline drains between
+    // calls: 16K pieces = 4 chunks over 7 parts read at ~40 % (200K: 191 -> 286 s); the turn boundaries are the useful ones)
+    const int64_t ckpt_every = std::max<int64_t>(0, (int64_t) env_num("STRATA_GLM_CKPT_EVERY", mimo2 ? 0 : 16384));
     // a prompt writes the state from position `from` on: the checkpoints past it no longer hold this conversation
     const auto ckpt_drop_past = [&](size_t from) {
         for (auto& c : ckpts)
@@ -1458,14 +1463,21 @@ static int glm_pack_generate(const Options& o) {
     // the positions in [from + 512, end) a prompt read from `from` keeps checkpoints at (see above), ascending
     const auto ckpt_marks = [&](const std::vector<int32_t>& prompt, size_t from, size_t end) {
         constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
+        // mimo2 (Qwen-style template): a turn opens with <|im_start|> and its role - user (872) or tool (14172)
+        constexpr int32_t kImStart = 151644, kMimoUser = 872, kMimoTool = 14172;
         std::vector<size_t> at;
         if (ckpt_max <= 0 || !cur_img_pos.empty() || end <= from + 512) return at;
         size_t first = 0, last = 0;
-        for (size_t i = 1; i < end; ++i)
-            if (prompt[i] == kUserTok || prompt[i] == kObsTok) {
-                if (first == 0 && prompt[i] == kUserTok) first = i;
+        for (size_t i = 1; i < end; ++i) {
+            const bool user = mimo2 ? prompt[i] == kImStart && i + 1 < end && prompt[i + 1] == kMimoUser
+                                    : prompt[i] == kUserTok;
+            const bool obs = mimo2 ? prompt[i] == kImStart && i + 1 < end && prompt[i + 1] == kMimoTool
+                                   : prompt[i] == kObsTok;
+            if (user || obs) {
+                if (first == 0 && user) first = i;
                 last = i;
             }
+        }
         std::vector<size_t> turns;
         for (const size_t p : {first, last})
             if (p >= from + 512 && p < end) turns.push_back(p);
@@ -1640,6 +1652,7 @@ static int glm_pack_generate(const Options& o) {
                 return 1;
             }
         }
+        const bool pwin = model.fast() && model.prompt_window_ready();
         for (size_t i = i_first; i < prompt.size();) {
             strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
             strata::core::progress_beat();
@@ -1655,8 +1668,12 @@ static int glm_pack_generate(const Options& o) {
             }
             size_t chunk = std::min<size_t>(8, prompt.size() - i);
             if (model.fast() && !snapped && i + chunk > prompt.size() - 1) chunk = prompt.size() - 1 - i;
+            // the tokens before the prompt's last through the pipelined window (prompt_window: a chat's new turn, too
+            // short for the prompt path); the last one stays on the token path - its logits start the answer
+            if (pwin && chunk > 1 && i + chunk >= prompt.size()) chunk -= 1;
             std::vector<int32_t> part(prompt.begin() + (long) i, prompt.begin() + (long) (i + chunk));
-            const bool ok = model.forward(part, lg, err);
+            const bool ok = pwin && chunk > 1 ? model.prompt_window(part.data(), (int) chunk, prompt[i + chunk], err)
+                                              : model.forward(part, lg, err);
             if (!ok) {
                 snap_tokens.clear();
                 drop_if_poisoned(prompt, err);
@@ -1882,7 +1899,10 @@ static int glm_pack_generate(const Options& o) {
             // drafts a chain, the pipelined window checks it across the parts at once (same tokens as the loop below)
             int64_t n_spec = 0;
             const uint64_t rounds0 = model.mtp_rounds_;
-            if (!model.decode_mtp_pipe(sp, max_new, on_token, n_spec, err)) {
+            model.look_ctx_ = &prompt;
+            const bool dok = model.decode_mtp_pipe(sp, max_new, on_token, n_spec, err);
+            model.look_ctx_ = nullptr;
+            if (!dok) {
                 drop_if_poisoned(prompt, err);
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -2848,6 +2868,10 @@ static int glm_pack_generate(const Options& o) {
     // floats) in prompt order; their rows stand in for the prompt's <|image|> tokens, in order (GLM-5.3's image
     // tokens take no positions of their own: the rows only replace the embeddings)
     constexpr int64_t kGlmImageToken = 154854;   // <|image|>
+    // MiMo-V2.6-Pro (mimo2): <|image_pad|> (config image_token_id); its rows sit on plain 1-D positions, as any token
+    constexpr int64_t kMimoImagePad = 151655;
+    const int64_t image_token = model.geometry().arch == strata::core::Glm5Geometry::Glm5Arch::Mimo2 ? kMimoImagePad
+                                                                                                : kGlmImageToken;
     std::vector<int32_t> lp_ctx;   // LOGP: the context the saved state belongs to (the state before its last token)
     // #477 --expert-profile-save: what the expert tiers learned, every --expert-profile-save-every minutes before the
     // next request (a prompt's lent slots are back by then) and after the last one
@@ -3091,7 +3115,7 @@ static int glm_pack_generate(const Options& o) {
                 }
                 if (f) std::fclose(f);
                 for (size_t i = 0; ge.empty() && i < toks.size(); ++i)
-                    if (toks[i] == kGlmImageToken) cur_img_pos.push_back((int64_t) i);
+                    if (toks[i] == image_token) cur_img_pos.push_back((int64_t) i);
                 if (ge.empty() && (int64_t) cur_img_pos.size() * E != (int64_t) cur_img_rows.size())
                     ge = std::to_string(cur_img_pos.size()) + " image tokens, " +
                          std::to_string(cur_img_rows.size() / (size_t) E) + " image rows";

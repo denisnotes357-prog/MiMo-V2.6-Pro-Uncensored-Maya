@@ -34,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <unordered_map>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -327,7 +328,10 @@ bool Glm5Model::mtp_cache_setup(std::string& err) {
     const size_t a = 256;
     const auto up = [&](size_t b) { return (b + a - 1) / a * a; };
     const size_t f = sizeof(float);
-    const size_t sz[8] = {up(rows * E * f), up(rows * E * f), up(rows * E * f), up(rows * g.lat_row() * f),
+    const int64_t kv_raw_w = g.arch == Glm5Geometry::Glm5Arch::Mimo2   // (mimo2: the fused q|k|v of a row)
+                                 ? (int64_t) g.n_head * g.head_k + g.kv_row_k() + g.kv_row_v()
+                                 : (int64_t) g.lat_row();
+    const size_t sz[8] = {up(rows * E * f), up(rows * E * f), up(rows * E * f), up(rows * kv_raw_w * f),
                           up(rows * g.idx_key * f), up(rows * g.idx_key * f), up(rows * q8_bytes(2 * E)),
                           up(rows * q8_bytes(E))};
     size_t total = 0;
@@ -369,7 +373,8 @@ void Glm5Model::mtp_cache_free() {
 // and the token next[i] (the one at p0 + i + 1; an image row there stands in for it) - the cache-writing half of the
 // block (glm_prefill.cu's for a prompt): eh_proj, the attention norm, kv_a and the indexer's key and gate, written
 // through KV streaming's hook where the block's cache is streamed.  This part carries the block.
-bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync) {
+bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync,
+                               int blk) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     if (F == nullptr || mtp_il_ < 0 || n <= 0) return true;
@@ -380,7 +385,11 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
     }
     cudaStream_t s = F->cs;
     const int64_t E = g.n_embd;
-    const auto& Ly = F->L[(size_t) mtp_il_];
+    if (blk < 0 || blk > mtp_more_) {
+        err = "glm mtp: no MTP block " + std::to_string(blk);
+        return false;
+    }
+    const auto& Ly = F->L[(size_t) mtp_il_ + blk];
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
         err = "glm mtp: no embedding dequantizer";
@@ -389,14 +398,28 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
     cudaSetDevice(dev_);
     // the pinned rows may still feed an earlier copy of this stream (sync = false: the caller knows they do not - the
     // MTP decode's round, after the verify it waited for)
+    bool dev_emb = blk > 0 && F->mtp_emb != nullptr && F->mtp_ftok != nullptr && n <= kPipeMax;
+    for (int i = 0; dev_emb && i < n; ++i)
+        if (image_row(p0 + i + 1 + blk) != nullptr) dev_emb = false;
+    if (dev_emb) {
+        // native blocks 1/2: the ids through this block's pinned slot (the round after reads it only once this stream
+        // has passed the copy: its drafts wait on their events), embedded on the device
+        int* th = F->mtp_ftok_h + (size_t) blk * kPipeMax;
+        int* td = F->mtp_ftok + (size_t) blk * kPipeMax;
+        for (int i = 0; i < n; ++i) th[i] = next[i];
+        cudaMemcpyAsync(td, th, (size_t) n * sizeof(int), cudaMemcpyHostToDevice, s);
+        for (int i = 0; i < n; ++i)
+            gf::embed_tok(F->mtp_emb, F->mtp_emb_type, (int) g.n_vocab, td + i, (int) E, C.emb + (size_t) i * E, s);
+    } else {
     if (sync && !glmfast::cuda_ok(cudaStreamSynchronize(s), "glm mtp cache sync", err)) return false;
     const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, g.n_embd);
     for (int i = 0; i < n; ++i) {
         float* row = C.emb_h + (size_t) i * E;
-        if (const float* img = image_row(p0 + i + 1)) std::memcpy(row, img, (size_t) E * sizeof(float));
+        if (const float* img = image_row(p0 + i + 1 + blk)) std::memcpy(row, img, (size_t) E * sizeof(float));
         else tt->to_float(pack_emb_src_ + (size_t) next[i] * row_b, row, g.n_embd);
     }
     cudaMemcpyAsync(C.emb, C.emb_h, (size_t) n * E * sizeof(float), cudaMemcpyHostToDevice, s);
+    }
     for (int i = 0; i < n; ++i)
         gf::mtp_in(C.emb + (size_t) i * E, h + (size_t) i * E, Ly.enorm, Ly.hnorm, g.norm_eps, g.n_embd,
                    (uint8_t*) C.catq + (size_t) i * q8_bytes(2 * E), s);
@@ -411,6 +434,29 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
     for (int i = 0; i < n; ++i)
         gf::rms_q8(C.hid + (size_t) i * E, nullptr, Ly.attn_norm, g.norm_eps, g.n_embd, C.x + (size_t) i * E,
                    (uint8_t*) C.xq + (size_t) i * q8_bytes(E), s);
+    if (g.arch == Glm5Geometry::Glm5Arch::Mimo2) {
+        // mimo2: the block's K/V rows - the fused projection (its q part unused), NeoX RoPE on k with the SWA base, FP16
+        // into the ring (fast_mimo2's store)
+        const int64_t q_size = (int64_t) g.n_head * g.head_k;
+        const int64_t n_qkv = q_size + g.kv_row_k() + g.kv_row_v();
+        gf::MvJob jq = {Ly.q.q, C.xq, C.x, C.kv_raw, nullptr, 1.0f, Ly.q.type, g.n_embd, (int) n_qkv};
+        jq.ncol = n;
+        jq.xq_cstride = (int64_t) q8_bytes(E);
+        jq.xf_cstride = E;
+        jq.y_cstride = n_qkv;
+        if (!gf::mv(&jq, 1, s)) {
+            err = "glm mtp: the cache rows' qkv";
+            return false;
+        }
+        for (int i = 0; i < n; ++i)
+            if (!mimo_mtp_kv_row(C.kv_raw + (size_t) i * n_qkv, p0 + i, err, mtp_il_ + blk)) return false;
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            err = std::string("glm mtp cache: ") + cudaGetErrorString(e);
+            return false;
+        }
+        return true;
+    }
     if (g.arch == Glm5Geometry::Glm5Arch::Dsa) {
         // glm-dsa: the cache row [latent | rotated k_rope] (lat_row floats in) and, the block having its own indexer,
         // the rotated indexer key - fast_dsa53's dsa53_prep without the query
@@ -947,6 +993,13 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
             cudaSetDevice(m->dev_);
         }
     } drain_on_exit{this};
+    // mimo2's native drafting (STRATA_MIMO_MTP3, blocks 1 .. mtp_more_ loaded): depth k is block k at the round's
+    // position p0 - 1, fed the trunk's hidden state there and the token of depth k - 1 - the drafts step by step (a
+    // block past 1 first needs a provisional cache entry with an earlier draft, read on the host).  Block k's ring entry
+    // for position q holds (h_q, token q + 1 + k): after the verify, blocks 1 and 2 get theirs from p0 - 1 and p0 - 2 on
+    // with the now-known tokens; hprev keeps the trunk's hidden state one position before head_x for block 2.
+    const bool native = tail->mtp_more_ > 0 && g.arch == Glm5Geometry::Glm5Arch::Mimo2 && !use_oracle;
+    int64_t hprev_pos = -1;   // the position of the trunk's hidden state in FT->mtp_hprev (-1: none)
     const bool chain = FT->mtp_emb != nullptr;
     constexpr double kOutMax = 0.02;   // (decode_mtp's: above it the drafts take the whole head)
     // STRATA_GLM_SPEC_SAMPLE=1: SPECULATIVE SAMPLING for a sampled request (decode_spec's, over the whole chain) - draft
@@ -992,7 +1045,50 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
                              !tail->mtp_vin_[(size_t) tok];
         tail->mtp_out_ += ((outside ? 1.0 : 0.0) - tail->mtp_out_) / 64.0;
     };
-    note(y);
+    // STRATA_GLM_LOOKUP=1: PROMPT-LOOKUP drafts - when the text's last three tokens stood earlier in the context (the
+    // prompt, then what was written), the tokens that followed them there are the drafts (up to kPipeMax - 1): code
+    // edits, quotes and agents' tool output repeat their context.  A trigram index (exact keys: ids < 2^18) gives the
+    // latest earlier occurrence; a lookup round runs block 0's step alone (its cache and the native blocks' state stay
+    // whole) and verifies like a plain draw (exact match - the drafts have no distribution of their own).  Chosen over
+    // MTP while its recent rounds kept more (an EMA of tokens kept a round, each), probed every 8th eligible round.
+    static const bool lookup_env = [] {
+        const char* e = getenv("STRATA_GLM_LOOKUP");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    const bool lookup_on = lookup_env && !use_oracle && look_ctx_ != nullptr && g.n_vocab <= (1 << 18);
+    std::vector<int32_t> hist;
+    std::unordered_map<uint64_t, int32_t> tri;   // trigram -> its latest end position in hist
+    int32_t look_prev = -1;                      // the previous end position of hist's last trigram (-1: none)
+    const auto hist_push = [&](int32_t t) {
+        hist.push_back(t);
+        const size_t e = hist.size() - 1;
+        look_prev = -1;
+        if (e < 2) return;
+        const uint64_t key = ((uint64_t) (uint32_t) hist[e - 2] << 36) | ((uint64_t) (uint32_t) hist[e - 1] << 18) |
+                             (uint64_t) (uint32_t) t;
+        auto [it, fresh] = tri.try_emplace(key, (int32_t) e);
+        if (!fresh) {
+            look_prev = it->second;
+            it->second = (int32_t) e;
+        }
+    };
+    if (lookup_on) {
+        const auto tb = std::chrono::steady_clock::now();
+        hist.reserve(look_ctx_->size() + (size_t) std::max<int64_t>(max_new, 0) + 8);
+        tri.reserve(look_ctx_->size() + 1024);
+        for (int32_t t : *look_ctx_) hist_push(t);
+        const double bms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tb).count();
+        if (bms > 5.0)
+            std::fprintf(stderr, "glm mtp pipe: prompt lookup index over %zu tokens (%zu trigrams) in %.1f ms\n",
+                         hist.size(), tri.size(), bms);
+    }
+    double lk_ema = 3.0, mtp_ema = 1.5;   // tokens kept a round: lookup rounds, MTP rounds
+    int64_t lk_rounds = 0, lk_drafted = 0, lk_accepted = 0, lk_skipped = 0;
+    const auto note_tok = [&](int t) {
+        note(t);
+        if (lookup_on) hist_push(t);
+    };
+    note_tok(y);
     std::vector<int32_t> tok, out;
     int64_t rounds = 0, plain = 0, drafted = 0, accepted = 0;
     int64_t reach[kPipeMax] = {}, hit[kPipeMax] = {};   // per draft depth: compared (every draft before it stood), accepted
@@ -1011,11 +1107,29 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
     for (;;) {
         const int64_t p0 = pos_;
         const auto t0 = clk::now();
-        int n = use_oracle ? n_cap : tail->mtp_choose(n_cap);
-        n = (int) std::min<int64_t>(n, max_new - produced - 1);
-        n = (int) std::min<int64_t>(n, max_ctx_ - 1 - p0);
-        if (use_oracle) n = (int) std::min<int64_t>(n, (int64_t) oracle.size() - produced);
-        else if (tail->mtp_hx_pos_ != p0 - 1) n = 0;   // (no trunk state to draft from: a plain token)
+        // a lookup round, decided first (it neither spends mtp_choose's probes nor waits for a nonzero MTP length): the
+        // continuation of the last trigram's previous occurrence - a verified match of 3+, at least 2 tokens - where
+        // block 0's step has the trunk's state to read
+        bool lookup = false;
+        int lk_n = 0;
+        if (lookup_on && look_prev >= 0 && tail->mtp_hx_pos_ == p0 - 1) {
+            const int64_t e = (int64_t) hist.size() - 1;
+            lk_n = (int) std::min<int64_t>({(int64_t) kPipeMax - 1, e - look_prev, max_new - produced - 1,
+                                             max_ctx_ - 1 - p0});
+            int m = 0;   // the match's length
+            while (m < 32 && look_prev - m >= 0 && hist[(size_t) (look_prev - m)] == hist[(size_t) (e - m)]) ++m;
+            if (m >= 3 && lk_n >= 2)
+                lookup = lk_ema >= mtp_ema + 0.5 || m >= 12 || (++lk_skipped % 8) == 0;
+        }
+        int n = lk_n;
+        if (!lookup) {
+            n = use_oracle ? n_cap : tail->mtp_choose(n_cap);
+            if (native) n = std::min(n, 1 + tail->mtp_more_);   // (a trained block for every depth)
+            n = (int) std::min<int64_t>(n, max_new - produced - 1);
+            n = (int) std::min<int64_t>(n, max_ctx_ - 1 - p0);
+            if (use_oracle) n = (int) std::min<int64_t>(n, (int64_t) oracle.size() - produced);
+            else if (tail->mtp_hx_pos_ != p0 - 1) n = 0;   // (no trunk state to draft from: a plain token)
+        }
         n = std::max(n, 0);
         if (n == 0) {
             // a plain token (the token path keeps the NextN cache: entry p0 - 1)
@@ -1024,6 +1138,7 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
             const int y2 = forced(sample_token(sp, err));
             if (y2 < 0) return false;
             ++plain;
+            hprev_pos = -1;   // (the native fill's hidden states skip this position)
             ++rounds;
             ++mtp_rounds_;
             ++mtp_round_n_[0];
@@ -1043,15 +1158,18 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
             sp.counter += 1;
             ++produced;
             last_tok_ = y2;
-            note(y2);
+            note_tok(y2);
             if (!emit(y2) || produced >= max_new || pos_ + 1 >= max_ctx_) break;
             y = y2;
             continue;
         }
+        const bool ss = spec_sample && !lookup;   // (this round's verify draws the drafts' way)
         const int T = 1 + n;
         tok.assign((size_t) T, 0);
         out.assign((size_t) T, -1);
         tok[0] = y;
+        if (lookup)
+            for (int i = 1; i < T; ++i) tok[(size_t) i] = hist[(size_t) (look_prev + i)];
         // ---- 1. the drafts, queued on the last part ahead of the window's tokens
         bool sub = false;
         if (use_oracle) {
@@ -1064,32 +1182,51 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
         } else {
             cudaSetDevice(tail->dev_);
             if (!FT->route_ok(err)) return false;
-            sub = !spec_sample && FT->mtp_dv > 0 && tail->mtp_out_ < kOutMax;   // (a drawn draft needs the whole head)
+            sub = !ss && FT->mtp_dv > 0 && tail->mtp_out_ < kOutMax;   // (a drawn draft needs the whole head)
             if (chain) {
-                for (int i = 0; i < n; ++i) {
-                    if (spec_sample) {
+                tail->mtp_native_ = native;
+                tail->mtp_prov_ok_ = native && hprev_pos == p0 - 2;
+                for (int i = 0; i < (lookup ? 1 : n); ++i) {   // (a lookup round: block 0's step alone)
+                    if (ss) {
                         dsp[(size_t) i] = sp;
                         dsp[(size_t) i].counter = sp.counter + (uint64_t) i;
                         tail->mtp_sample_ = &dsp[(size_t) i];
+                    } else {
+                        tail->mtp_sample_ = nullptr;
                     }
-                    if (!tail->fast_mtp(p0 - 1 + i, i == 0 ? y : -1, err, i, sub, false)) return false;
+                    if (!tail->fast_mtp(native ? p0 - 1 : p0 - 1 + i, i == 0 ? y : -1, err, i, sub, false)) {
+                        tail->mtp_native_ = false;
+                        return false;
+                    }
                     cudaMemcpyAsync(FT->mtp_tok_h + i, FT->mtp_tok + i, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
                     cudaEventRecord(tail->mtp_step_ev_[(size_t) i], FT->cs);
                 }
+                tail->mtp_native_ = false;
             } else {
                 // step by step (each step's token through the host): the drafts are out before the window begins
                 int32_t t = y;
-                for (int i = 0; i < n; ++i) {
-                    if (spec_sample) {
+                for (int i = 0; i < (lookup ? 1 : n); ++i) {
+                    if (ss) {
                         dsp[(size_t) i] = sp;
                         dsp[(size_t) i].counter = sp.counter + (uint64_t) i;
                         tail->mtp_sample_ = &dsp[(size_t) i];
+                    } else {
+                        tail->mtp_sample_ = nullptr;
                     }
-                    if (!tail->fast_mtp(p0 - 1 + i, t, err, i, sub) ||
-                        !glmfast::wait_event(FT->ev_mtp, "glm mtp pipe draft", err) || !FT->route_ok(err))
+                    if (native && i == 2) {
+                        // block 2's entry at p0 - 2 wants token p0 + 1: the first draft, provisionally (the fill after
+                        // the verify rewrites it); without the trunk's state there the block reads what its ring holds
+                        if (hprev_pos == p0 - 2 && !tail->mtp_cache_rows(p0 - 2, 1, FT->mtp_hprev, &tok[1], err, true, 2))
+                            return false;
+                        cudaSetDevice(tail->dev_);
+                    }
+                    tail->mtp_native_ = native;
+                    const bool ok = tail->fast_mtp(native ? p0 - 1 : p0 - 1 + i, t, err, i, sub);
+                    tail->mtp_native_ = false;
+                    if (!ok || !glmfast::wait_event(FT->ev_mtp, "glm mtp pipe draft", err) || !FT->route_ok(err))
                         return false;
                     t = FT->mtp_tok_h[i];
-                    tok[(size_t) i + 1] = t;
+                    if (!lookup) tok[(size_t) i + 1] = t;
                 }
             }
             tail->mtp_hx_pos_ = -1;   // (head_x holds the block's hidden state now)
@@ -1100,13 +1237,13 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
         //         the last one's late tokens without waiting for the devices; every 8th waits, so the tiers' boundary
         //         runs even when no window finds the devices idle
         // (the last part's picks: rows 0 .. n - 1 verify the drawn drafts; set before the window's first token is queued)
-        FT->win.spec_qs = spec_sample ? FT->spec_qs : nullptr;
-        FT->win.spec_drafts = spec_sample ? FT->mtp_tok : nullptr;
-        FT->win.spec_rows = spec_sample ? n : 0;
+        FT->win.spec_qs = ss ? FT->spec_qs : nullptr;
+        FT->win.spec_drafts = ss ? FT->mtp_tok : nullptr;
+        FT->win.spec_rows = ss ? n : 0;
         if (!win_pipe_begin(y, err, &sp, rounds == 0 || (fresh_every > 0 && rounds % fresh_every == 0))) return false;
         const int bank = FT->win.bank;   // (the last part's head rows of this window)
         for (int i = 0; i < n; ++i) {
-            if (!use_oracle && chain) {
+            if (!use_oracle && !lookup && chain) {
                 cudaSetDevice(tail->dev_);
                 cudaError_t e;
                 while ((e = cudaEventQuery(tail->mtp_step_ev_[(size_t) i])) == cudaErrorNotReady) std::this_thread::yield();
@@ -1132,11 +1269,19 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
         //      the reasoning closed by the caller - ends the run there, like a wrong draft)
         int acc = 0;
         while (acc < T - 1 && tok[(size_t) acc + 1] == out[(size_t) acc]) ++acc;
-        for (int i = 1; i <= std::min(acc + 1, T - 1); ++i) {
+        if (lookup) {
+            lk_ema += (1.0 + acc - lk_ema) * 0.25;
+            ++lk_rounds;
+            lk_drafted += n;
+            lk_accepted += acc;
+        } else if (lookup_on) {
+            mtp_ema += (1.0 + acc - mtp_ema) * 0.25;
+        }
+        for (int i = 1; !lookup && i <= std::min(acc + 1, T - 1); ++i) {
             ++reach[i];
             hit[i] += i <= acc ? 1 : 0;
         }
-        for (int i = 1; i <= std::min(acc + 1, T - 1) && i < 9; ++i) {
+        for (int i = 1; !lookup && i <= std::min(acc + 1, T - 1) && i < 9; ++i) {
             tail->mtp_hit_[i] *= acc_keep;
             tail->mtp_reach_[i] = tail->mtp_reach_[i] * acc_keep + 1.0;
             if (i <= acc) tail->mtp_hit_[i] += 1.0;
@@ -1146,7 +1291,7 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
         for (; kept < acc; ++kept) {
             sp.counter += 1;
             ++produced;
-            note(tok[(size_t) kept + 1]);
+            note_tok(tok[(size_t) kept + 1]);
             more = emit(tok[(size_t) kept + 1]) && produced < max_new;
             if (!more || force_tok_ >= 0) {
                 ++kept;
@@ -1161,12 +1306,38 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
             cudaSetDevice(tail->dev_);
             const float* rows = FT->win.head_x + (size_t) bank * kPipeMax * E;
             if (keep > 1 && !tail->mtp_cache_rows(p0, keep - 1, rows, tok.data() + 1, err, false)) return false;
+            if (native) {
+                // the tokens p0 + 1 .. p0 + keep (the kept drafts, then y2) - block k's entries q = p0 - k .. read
+                // token q + 1 + k: the same list for both blocks, over hidden states shifted by one position
+                std::vector<int32_t> tt((size_t) keep);
+                for (int j = 0; j + 1 < keep; ++j) tt[(size_t) j] = tok[(size_t) j + 1];
+                tt[(size_t) keep - 1] = y2;
+                const size_t rb = (size_t) E * sizeof(float);
+                float* h1 = FT->mtp_hrows;                   // block 1: h(p0 - 1), rows 0 .. keep - 2
+                cudaMemcpyAsync(h1, FT->mtp_h0, rb, cudaMemcpyDeviceToDevice, FT->cs);
+                if (keep > 1) cudaMemcpyAsync(h1 + E, rows, rb * (size_t) (keep - 1), cudaMemcpyDeviceToDevice, FT->cs);
+                if (!tail->mtp_cache_rows(p0 - 1, keep, h1, tt.data(), err, false, 1)) return false;
+                if (tail->mtp_more_ >= 2 && hprev_pos == p0 - 2) {
+                    float* h2 = FT->mtp_hrows + (size_t) (kPipeMax + 2) * E;   // block 2: h(p0 - 2), h(p0 - 1), rows 0 .. keep - 3
+                    cudaSetDevice(tail->dev_);
+                    cudaMemcpyAsync(h2, FT->mtp_hprev, rb, cudaMemcpyDeviceToDevice, FT->cs);
+                    cudaMemcpyAsync(h2 + E, FT->mtp_h0, rb, cudaMemcpyDeviceToDevice, FT->cs);
+                    if (keep > 2) cudaMemcpyAsync(h2 + 2 * E, rows, rb * (size_t) (keep - 2), cudaMemcpyDeviceToDevice, FT->cs);
+                    if (!tail->mtp_cache_rows(p0 - 2, keep, h2, tt.data(), err, false, 2)) return false;
+                }
+                cudaSetDevice(tail->dev_);
+                // the trunk's state one position before the next round's: p0 + keep - 2
+                cudaMemcpyAsync(FT->mtp_hprev, keep > 1 ? rows + (size_t) (keep - 2) * E : FT->mtp_h0, rb,
+                                cudaMemcpyDeviceToDevice, FT->cs);
+                hprev_pos = p0 + keep - 2;
+            }
             cudaMemcpyAsync(FT->head_x, rows + (size_t) (keep - 1) * E, (size_t) E * sizeof(float),
                             cudaMemcpyDeviceToDevice, FT->cs);
             tail->mtp_hx_pos_ = p0 + keep - 1;
             cudaSetDevice(dev_);
         }
-        // the statistics and the adaptive length's measurements (decode_mtp's)
+        // the statistics (every round's drafts, lookup's too) and the adaptive length's measurements (decode_mtp's;
+        // MTP rounds only - after a lookup round the next ones re-warm before they are measured)
         ++rounds;
         ++mtp_rounds_;
         ++mtp_round_n_[std::min(n, 8)];
@@ -1176,13 +1347,16 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
         spec_hits_ += (uint64_t) acc;
         const auto t4 = clk::now();
         const double ms = ms_between(t0, t4);
-        if (n == tail->mtp_prev_n_) {
+        if (lookup) {
+            tail->mtp_prev_n_ = -1;
+            tail->mtp_same_ = 0;
+        } else if (n == tail->mtp_prev_n_) {
             ++tail->mtp_same_;
         } else {
             tail->mtp_prev_n_ = n;
             tail->mtp_same_ = 0;
         }
-        if (tail->mtp_same_ >= 2 && n < 9) {
+        if (!lookup && tail->mtp_same_ >= 2 && n < 9) {
             tail->mtp_ms_[n] += (ms - tail->mtp_ms_[n]) / (double) std::min<uint64_t>(tail->mtp_seen_[n] + 1, 10);
             ++tail->mtp_seen_[n];
         }
@@ -1193,17 +1367,21 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
             ph_rest += ms_between(t3, t4);
         }
         if (trace)
-            std::fprintf(stderr, "glm mtp pipe: p0 %lld drafts %d accepted %d kept %d (%.1f ms)\n", (long long) p0, n,
-                         acc, keep, ms);
+            std::fprintf(stderr, "glm mtp pipe: p0 %lld %s %d accepted %d kept %d (%.1f ms)\n", (long long) p0,
+                         lookup ? "lookup" : "drafts", n, acc, keep, ms);
         if (!more) break;
         sp.counter += 1;
         ++produced;
         last_tok_ = y2;
-        note(y2);
+        note_tok(y2);
         if (!emit(y2) || produced >= max_new || pos_ + 1 >= max_ctx_) break;
         y = y2;
     }
     win_prof_report();
+    if (lk_rounds > 0)
+        std::fprintf(stderr, "glm mtp pipe: prompt lookup %lld rounds, %.2f drafts and %.2f accepted a round\n",
+                     (long long) lk_rounds, (double) lk_drafted / (double) lk_rounds,
+                     (double) lk_accepted / (double) lk_rounds);
     if (rounds > 0)
         std::fprintf(stderr, "glm mtp pipe: %lld rounds (%lld plain), %.2f drafts and %.2f accepted a round%s\n",
                      (long long) rounds, (long long) plain, (double) drafted / (double) rounds,
@@ -1224,6 +1402,59 @@ bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_
     if (gf::launch_errors() > 0) {
         err = "glm mtp pipe: a kernel launch failed (see stderr)";
         return false;
+    }
+    return true;
+}
+
+bool Glm5Model::prompt_window_ready() const {
+    static const bool off = [] {
+        const char* e = getenv("STRATA_GLM_PROMPT_WIN");
+        return e != nullptr && std::atoi(e) == 0;
+    }();
+    return !off && g_.arch == Glm5Geometry::Glm5Arch::Mimo2 && fast_ != nullptr && split_next_ != nullptr &&
+           mtp_pipe_ready();
+}
+
+bool Glm5Model::prompt_window(const int32_t* tokens, int n, int32_t next, std::string& err) {
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    FastState* FT = tail->fast_;
+    const int64_t E = g_.n_embd;
+    const bool mtp = tail->mtp_il_ >= 0;
+    const auto tok_at = [&](int j) -> int32_t { return j < n ? tokens[j] : j == n ? next : -1; };
+    int32_t out[kPipeMax], nx[kPipeMax];
+    for (int at = 0; at < n;) {
+        const int T = std::min(kPipeMax, n - at);
+        const int64_t p0 = pos_;
+        if (!win_pipe_begin(tokens[at], err, nullptr, true)) return false;
+        const int bank = FT->win.bank;   // (the last part's head rows of this window)
+        for (int t = 1; t < T; ++t)
+            if (!win_pipe_push(tokens[at + t], err)) return false;
+        if (!win_pipe_end(out, err) || !window_commit(T, err)) return false;
+        if (mtp) {
+            // block k's entry for position q reads h_q (the window's head rows) and token q + 1 + k: the rows whose
+            // token is known (the piece's last k + 1 wait for the decode's fill when `next` is unknown)
+            cudaSetDevice(tail->dev_);
+            const float* rows = FT->win.head_x + (size_t) bank * kPipeMax * E;
+            for (int k = 0; k <= tail->mtp_more_; ++k) {
+                int c = 0;
+                while (c < T && tok_at(at + c + 1 + k) >= 0) {
+                    nx[c] = tok_at(at + c + 1 + k);
+                    ++c;
+                }
+                if (c > 0 && !tail->mtp_cache_rows(p0, c, rows, nx, err, k > 0, k)) return false;   // (k > 0: block 0's
+                // host rows may still be in flight when an image row sends a later block through them)
+            }
+            tail->mtp_hx_pos_ = -1;
+            cudaSetDevice(dev_);
+        }
+        at += T;
+    }
+    if (mtp) {
+        cudaSetDevice(tail->dev_);
+        const cudaError_t e = cudaStreamSynchronize(FT->cs);
+        cudaSetDevice(dev_);
+        if (!glmfast::cuda_ok(e, "glm prompt window", err)) return false;
     }
     return true;
 }

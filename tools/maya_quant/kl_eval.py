@@ -28,6 +28,7 @@ def main():
     ap.add_argument("--len", type=int, default=1024, help="tokens per sequence used")
     ap.add_argument("--exe", default=str(pathlib.Path(__file__).resolve().parents[2] / "build" / "strata"))
     ap.add_argument("--max-context", type=int, default=8192)
+    ap.add_argument("--engine-args", default="", help="extra engine arguments, e.g. '--expert-cache auto'")
     a = ap.parse_args()
     ev = np.load(a.eval)
     ref = np.load(a.ref)
@@ -45,7 +46,7 @@ def main():
             path = f.name
         env = dict(os.environ, STRATA_GLM_SCORE=str(c), STRATA_GLM_SCORE_TOPK=path, STRATA_GLM_USAGE="0")
         r = subprocess.run([a.exe, "--glm-pack", a.pack, "--max-context", str(a.max_context), "--greedy",
-                            "--tokens", ",".join(map(str, toks.tolist()))], capture_output=True, text=True, env=env,
+                            "--tokens", ",".join(map(str, toks.tolist()))] + a.engine_args.split(), capture_output=True, text=True, env=env,
                            cwd=pathlib.Path(a.exe).parents[1])
         os.unlink(path)
         m = re.search(r"SCORE (\d+) tokens: nll ([\d.]+) ppl [\d.]+ top1 ([\d.]+)% \| vs ref: KL ([\d.]+) "

@@ -1,0 +1,12 @@
+{"name": "MiMo-Pro-M24",
+ "note": "~2.4 bpw experts so the whole model sits in 7 GPUs (320 GiB): gate/up IQ2_XXS, down IQ3_XXS (down is the sensitive one), first/last MoE layers' gate/up IQ2_XS; attention qkv/o Q4_K (dense bytes set decode speed, as in G-M24); router/bias F32; embed/output Q6_K; MTP blocks 70-72 Q4_K/Q6_K.",
+ "rules": [
+  {"match": "^blk\\.(7[0-2])\\.", "type": "Q4_K"},
+  {"match": "ffn_gate_inp|exp_probs_b", "type": "F32"},
+  {"match": "^blk\\.([1-3]|6[7-9])\\.ffn_(gate|up)_exps", "type": "IQ2_XS"},
+  {"match": "ffn_(gate|up)_exps", "type": "IQ2_XXS"},
+  {"match": "ffn_down_exps", "type": "IQ3_XXS"},
+  {"match": "^blk\\.\\d+\\.attn_(q|k|v|qkv|output)\\.weight$", "type": "Q4_K"},
+  {"match": "^blk\\.0\\.ffn_(gate|up|down)\\.weight$", "type": "Q6_K"}
+ ],
+ "default": "Q6_K"}
