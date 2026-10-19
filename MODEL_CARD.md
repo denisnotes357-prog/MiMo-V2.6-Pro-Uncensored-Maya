@@ -71,6 +71,9 @@ Details: [How it was made](https://github.com/denisnotes357-prog/MiMo-V2.6-Pro-U
 
 - ~2-bit experts: the answers are good but not identical to the full model; at temperature 1 Russian sometimes picks
   odd words. Lower the temperature for precise work.
+- 2026-10-19: speculative sampling of the drafts (`STRATA_GLM_SPEC_SAMPLE=1`) together with prompt-lookup drafts garbled
+  long answers at temperature 1; the shipped config now keeps it off (update `configs/mimo-pro-uncensored.json` if you
+  cloned earlier).
 - The numbers are from one machine (7 GPUs, PCIe). With less VRAM Maya serves the experts that do not fit from RAM,
   more slowly.
 - No capability benchmarks were run beyond perplexity, a 100K-token retrieval test and manual checks.

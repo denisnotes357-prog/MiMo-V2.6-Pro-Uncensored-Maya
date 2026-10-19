@@ -91,13 +91,13 @@ than ~1000 tokens segfaulted. The snapshot of `mimo2` is its sliding-window ring
 | Split-K, GQA-sharing decode attention for the 10 full layers | 70K context: 7.4 → 32 tok/s |
 | **All three MTP layers, as trained.** A `transformers` reference over the trunk's hidden states showed that chaining layer 0 three times gives 16 % / 3 % at depths 2 / 3, while layer *k* at depth *k* gives 56 % / 54 %. | 52 / 66 tok/s |
 | The MTP layers' rings filled while the prompt is read (no cold start) | depth-2 acceptance 42 → 56 % |
-| Speculative sampling of drafts at temperature > 0 (a buffer bug made it produce garbage before) | t = 1: +5–12 % |
+| Speculative sampling of drafts at temperature > 0 (a buffer bug made it produce garbage before) | t = 1: +5–12 % — **off in the release**: with prompt lookup it still garbles long answers (see section 6) |
 | A short chat turn through the pipelined window instead of token by token | 0.5 → 0.15 s |
 | No experts on the CPU (they made greedy output depend on timing, and cost 0.8 ms a token) | 57 / 73 tok/s |
 | Prompt-lookup drafts (repeat the context 7 tokens at a time) | code edits 81 → 106, proofreading 79 → 116 tok/s |
 | Vision on the GPU (the engine lends 5.7 GB per picture) + a pre-warmed process that forks the encoder | 12 → 1.6 s an image |
 | **Tensor-core decode attention.** The old kernel read the KV cache at only 0.3 TB/s — it was compute-bound. The new one puts the 16 query heads of a KV head into one `mma` tile and reaches 0.94 TB/s. | 200K: 20 → 33 tok/s |
-| INT8 KV cache for the full layers (an FP32 scale per position and head) | 200K: 38–40 tok/s; every expert in VRAM at 512K |
+| INT8 KV cache for the full layers (an FP32 scale per position and head) | 200K: 38–40 tok/s; 512K fits (~200–330 experts in RAM) |
 | Conversation checkpoints at the start of the last turn | another question to 200K: 3 min → ~1 s |
 
 ## 6. Dead ends (measured, not kept)
@@ -117,6 +117,13 @@ than ~1000 tokens segfaulted. The snapshot of `mimo2` is its sliding-window ring
 
 - Kernels against FP64 CPU references (`tests/mimo_decode_attn_test.cu`, `tests/mimo_prefill_attention.cu`).
 - Greedy output token-for-token equal between paths (prompt window vs token path, lookup drafts vs plain decoding).
-- Speculative sampling vs plain sampling: the same digit frequencies (χ² 3.9, threshold 16.9) and early-stop rates.
+- Speculative sampling vs plain sampling: the same digit frequencies (χ² 3.9, threshold 16.9) and early-stop rates. That
+  check used short answers; 9000-character scenes at temperature 1 later showed that speculative sampling together with
+  prompt lookup breaks long text (lines repeated up to 15 times, words falling apart). It is off in the release.
+- Greedy output is still not bit-for-bit repeatable between requests on the seven-GPU pipeline (the same question at
+  temperature 0 gave 403–470 tokens over six runs, every answer correct), whatever the drafting, KV or expert settings:
+  numeric order, not a leaked state - the first request after a start is always the same.
+- Long answers: `tools/mimo/bench/rep_test.py` (repeated lines anywhere in the text, not only adjacent ones, and
+  Latin letters inside Russian), compared with plain sampling of the same seeds.
 - A fact hidden in the middle of 100K tokens of text is found (`tools/mimo/bench/needle.py`).
 - Long-context speed measured on a second question to the same context, so that the model cannot just copy the text.

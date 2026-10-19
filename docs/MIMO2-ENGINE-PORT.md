@@ -41,7 +41,8 @@ MiMo was trained with **layer *k* predicting depth *k* from the trunk's hidden s
 - `decode_mtp_pipe` (`src/core/glm_mtp.cu`) pushes the drafts into the pipelined window (`win_pipe_*`, a thread per GPU
   part) as soon as each is out; the first wrong draft cancels the rows behind it.
 - `STRATA_GLM_SPEC_SAMPLE=1`: at temperature > 0 the drafts are drawn from the MTP layers' own distributions and accepted
-  with probability min(1, p/q) (residual draw on rejection) — the output keeps the target distribution.
+  with probability min(1, p/q) (residual draw on rejection). **Known bug:** combined with `STRATA_GLM_LOOKUP=1` it
+  garbles long answers at temperature 1, so the shipped config keeps it off.
 - `STRATA_GLM_LOOKUP=1`: a trigram index over the prompt and the written tokens; when the last three tokens occurred
   before, the up to 7 tokens that followed become the drafts of that round (block 0 still steps once so the MTP state
   stays consistent), verified like a plain draw. Chosen over MTP while its recent rounds kept more tokens.

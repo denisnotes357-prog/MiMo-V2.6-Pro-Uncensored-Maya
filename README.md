@@ -16,25 +16,25 @@ Measured on 5× RTX 4090 48 GB + 2× A100 40 GB (320 GB VRAM), 503 GB RAM; 400-t
 | --- | ---: |
 | Refusals on 40 JailbreakBench requests | 24 / 40 (the abliterated base; a runtime refusal vector is [in development](#refusals-and-the-refusal-vector)) |
 | Factual questions / questions about things that do not exist | 30 / 30 correct / 6 of 10 answered "unknown" honestly |
-| Long answers (4 × 1800-token Russian stories, temperature 1) | no loops or invented words |
+| Long answers (3 × ~9000-character Russian scenes, temperature 1, `rep_test.py`) | no repeated lines or broken words (identical to plain sampling); an earlier check that only looked for adjacent repeats missed a bug, see below |
 | Decode, Russian / code, temperature 0 | **55–58 / 71–75 tok/s** |
-| Decode, Russian / code, temperature 1 | **53–55 / 64–75 tok/s** |
+| Decode, Russian / code, temperature 1 | **58–63 / 81 tok/s** |
 | Decode when the answer repeats the context (code edits, proofreading) | **106–116 tok/s** |
 | Decode at 100K / 200K context | **38 / 38–40 tok/s** |
 | Prompt reading | **1500–1900 tok/s**; a 200K prompt in 155 s; a short chat turn in 0.15 s |
 | A new question to an already-read 200K conversation | **~1 s** (only its own tokens are read) |
 | An image | **~1.6 s** to encode (the model's own vision tower, on the GPU) |
-| Context | **512K**, every expert in VRAM |
+| Context | **512K** (with the INT8 KV cache ~200–330 of the 26,880 experts live in RAM and are fetched when routed) |
 | Russian / English perplexity (full-precision model ≈ 3.8 in Russian) | 4.03 / 4.25 |
 | Size | 300 GB GGUF + 0.3 GB pack + 1.5 GB vision tower |
 
-Speed history on that machine: 31 tok/s (plain decoding) → 45 / 59 (one MTP layer, pipelined window) → 52 / 66 (all three MTP layers, as the model was trained) → **55–58 / 71–75** (speculative sampling, no CPU lane, prompt lookup). Long context: 7.4 tok/s at 70K → 32 (split-K attention) → **38–40 at 200K** (tensor-core attention + INT8 KV cache).
+Speed history on that machine: 31 tok/s (plain decoding) → 45 / 59 (one MTP layer, pipelined window) → 52 / 66 (all three MTP layers, as the model was trained) → **55–58 / 71–75** at t = 0 (no CPU lane, prompt lookup). Long context: 7.4 tok/s at 70K → 32 (split-K attention) → **38–40 at 200K** (tensor-core attention + INT8 KV cache).
 
 ## What is in here
 
 - **Engine port to `mimo2`** (`src/core/glm_*.cu`, `src/kernels/cuda/mimo_*.cu`, `include/strata/kernels/mimo_*.hpp`): MiMo-V2.6-Pro inside Maya's `Glm5Model`, behind an architecture flag, so the GLM models keep working and MiMo inherits Maya's expert tiers, layer split across GPUs, OpenAI/Anthropic-compatible server and browser chat. Sliding-window layers keep a 256-row ring per layer; full-attention layers keep the whole context.
 - **All three native MTP layers** (`STRATA_MIMO_MTP3=1`): layer *k* drafts depth *k* from the trunk's hidden state, which is how MiMo was trained (chaining one layer three times leaves depth 2–3 nearly useless: 16 % / 3 % against 56 % / 54 % in a `transformers` reference). The drafts are verified as one window flowing through all seven GPUs.
-- **Speculative sampling** of the drafts at temperature > 0 (`STRATA_GLM_SPEC_SAMPLE=1`), checked against plain sampling (same distribution, χ² test).
+- **Speculative sampling** of the drafts at temperature > 0 (`STRATA_GLM_SPEC_SAMPLE=1`) is **off in the shipped config**: together with prompt-lookup drafts it garbles long answers at temperature 1 (lines repeat, words break up; found on 2026-10-19 with long Russian scenes). Each alone is clean; the fix of the combination is in progress. With it off, sampled answers are exactly plain sampling (same text for the same seed).
 - **Prompt-lookup drafts** (`STRATA_GLM_LOOKUP=1`): when the text repeats something from the conversation, up to 7 tokens of it are drafted at once.
 - **Batched prompt reading** for `mimo2` (sliding-window + sink attention on tensor cores, chunks of 4096) and a pipelined window for short pieces (a new chat turn).
 - **Tensor-core decode attention** for the full-attention layers (the 16 query heads of a KV head form one `mma` tile), memory-bound at 200K context; **INT8 KV cache** for those layers (`STRATA_MIMO_KV8=1`) — half the memory and traffic.
@@ -95,9 +95,9 @@ The shipped config is for 7 GPUs with ~320 GB of VRAM (GPU 1 of that machine lef
 | --- | --- |
 | `gpu`, `CUDA_VISIBLE_DEVICES` | the cards along the layer pipeline |
 | `STRATA_GLM_SPLIT=11,22,33,44,53,61` | the first layer of each next GPU (the two A100s get fewer layers) |
-| `--max-context 512000` | with `STRATA_MIMO_KV8=1` every expert stays in VRAM at 512K on this machine |
+| `--max-context 512000` | with `STRATA_MIMO_KV8=1`; on this machine ~200–330 experts then live in RAM (the `glm stat` line shows `vram`/`ram`) |
 | `STRATA_MIMO_MTP3=1`, `STRATA_GLM_MTP_PIPE=1`, `STRATA_GLM_MTP_DRAFT=7` | native three-layer MTP drafting, verified as a pipelined window |
-| `STRATA_GLM_SPEC_SAMPLE=1`, `STRATA_GLM_LOOKUP=1` | speculative sampling of drafts; prompt-lookup drafts |
+| `STRATA_GLM_SPEC_SAMPLE=0`, `STRATA_GLM_LOOKUP=1` | speculative sampling off (with lookup it garbles long sampled answers); prompt-lookup drafts on |
 | `STRATA_GLM_CPU_LANE=0`, `STRATA_GLM_PREFILL_CPU=0` | no experts on the CPU — faster here and (nearly) deterministic |
 | `STRATA_MIMO_KV8=1` | INT8 KV cache for the 10 full-attention layers |
 | `vision.gpu: true` | the vision tower on the first GPU (5.7 GB lent by the engine per picture) |
