@@ -14,5 +14,5 @@ MiMo-V2.6-Pro Uncensored on Maya combines work from several projects. Their lice
 | GLM-5.3 model weights (for the GLM-5.3 configs) | Z.AI — [zai-org/GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) | GLM-5.3 License | [LICENSES/GLM-5.3-LICENSE.txt](LICENSES/GLM-5.3-LICENSE.txt) |
 | ggml (fetched at build time at the commit Maya pins) and the `mimo2` / `glm-dsa` references | [llama.cpp](https://github.com/ggml-org/llama.cpp) | MIT | not vendored |
 
-The refusal vectors (`refusal-vector-L70.f32` on Hugging Face for MiMo, `tools/glm53/ablate/dir3.f32` for GLM-5.3) were
-measured from the models by this project.
+The GLM-5.3 refusal vector `tools/glm53/ablate/dir3.f32` was measured from the model by this project; the MiMo vector is
+in development and not shipped.

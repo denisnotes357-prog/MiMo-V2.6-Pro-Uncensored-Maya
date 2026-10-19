@@ -1,8 +1,8 @@
 # MiMo-V2.6-Pro Uncensored on Maya
 
-**Xiaomi's ~1-trillion-parameter MiMo-V2.6-Pro, uncensored, with its own vision, running at 55–75 tokens/s on seven GPUs with a 512K context.**
+**Xiaomi's ~1-trillion-parameter MiMo-V2.6-Pro (abliterated "heretic" base), with its own vision, running at 55–75 tokens/s on seven GPUs with a 512K context.**
 
-This repository is a fork of [Project Maya](https://github.com/mw00/project-maya) (MIT), the engine that runs large MoE models on your own GPUs. Maya did not know MiMo. Here the engine is ported to **MiMo-V2.6-Pro** (architecture `mimo2`: 70 layers, 384 experts, hybrid sliding-window + full attention with sinks, three multi-token-prediction layers, a native vision tower), a calibrated ~2-bit quant is built for it (300 GB, Russian kept intact), refusals are removed by a runtime refusal vector, and decoding is made fast enough for daily use — from 31 tok/s at the first working build to 55–75 tok/s now, and from 20 to 38–40 tok/s at 200K context.
+This repository is a fork of [Project Maya](https://github.com/mw00/project-maya) (MIT), the engine that runs large MoE models on your own GPUs. Maya did not know MiMo. Here the engine is ported to **MiMo-V2.6-Pro** (architecture `mimo2`: 70 layers, 384 experts, hybrid sliding-window + full attention with sinks, three multi-token-prediction layers, a native vision tower), a calibrated ~2-bit quant is built for it (300 GB, Russian kept intact), and decoding is made fast enough for daily use — from 31 tok/s at the first working build to 55–75 tok/s now, and from 20 to 38–40 tok/s at 200K context.
 
 [Русская версия](README.ru.md) · [How it was made](docs/HOW-IT-WAS-MADE.md) · [Engine port](docs/MIMO2-ENGINE-PORT.md) · [Model on Hugging Face](#download-the-model) · [GLM-5.3 Uncensored on Maya](https://github.com/denisnotes357-prog/GLM-5.3-Uncensored-Maya) · [Original Project Maya README](README.project-maya.md)
 
@@ -14,7 +14,9 @@ Measured on 5× RTX 4090 48 GB + 2× A100 40 GB (320 GB VRAM), 503 GB RAM; 400-t
 
 | | **MiMo-V2.6-Pro Uncensored (this repo)** |
 | --- | ---: |
-| Refusals on 40 JailbreakBench requests (judge: the same quant without the vector) | **5 / 40** (24 / 40 without the vector) |
+| Refusals on 40 JailbreakBench requests | 24 / 40 (the abliterated base; a runtime refusal vector is [in development](#refusals-and-the-refusal-vector)) |
+| Factual questions / questions about things that do not exist | 30 / 30 correct / 6 of 10 answered "unknown" honestly |
+| Long answers (4 × 1800-token Russian stories, temperature 1) | no loops or invented words |
 | Decode, Russian / code, temperature 0 | **55–58 / 71–75 tok/s** |
 | Decode, Russian / code, temperature 1 | **53–55 / 64–75 tok/s** |
 | Decode when the answer repeats the context (code edits, proofreading) | **106–116 tok/s** |
@@ -23,7 +25,7 @@ Measured on 5× RTX 4090 48 GB + 2× A100 40 GB (320 GB VRAM), 503 GB RAM; 400-t
 | A new question to an already-read 200K conversation | **~1 s** (only its own tokens are read) |
 | An image | **~1.6 s** to encode (the model's own vision tower, on the GPU) |
 | Context | **512K**, every expert in VRAM |
-| Russian perplexity (full-precision model ≈ 3.8) | 4.03 without the vector, 5.12 with it; English 4.06 |
+| Russian / English perplexity (full-precision model ≈ 3.8 in Russian) | 4.03 / 4.25 |
 | Size | 300 GB GGUF + 0.3 GB pack + 1.5 GB vision tower |
 
 Speed history on that machine: 31 tok/s (plain decoding) → 45 / 59 (one MTP layer, pipelined window) → 52 / 66 (all three MTP layers, as the model was trained) → **55–58 / 71–75** (speculative sampling, no CPU lane, prompt lookup). Long context: 7.4 tok/s at 70K → 32 (split-K attention) → **38–40 at 200K** (tensor-core attention + INT8 KV cache).
@@ -38,7 +40,7 @@ Speed history on that machine: 31 tok/s (plain decoding) → 45 / 59 (one MTP la
 - **Tensor-core decode attention** for the full-attention layers (the 16 query heads of a KV head form one `mma` tile), memory-bound at 200K context; **INT8 KV cache** for those layers (`STRATA_MIMO_KV8=1`) — half the memory and traffic.
 - **Conversation checkpoints**: the sliding-window rings at the start of the last turn are kept in RAM, so a different follow-up to a long conversation reads only its own tokens.
 - **Native vision** (`tools/mimo/mimo_vision.py`): the checkpoint's own vision transformer, run on the first GPU in VRAM the engine lends it while a picture is encoded; a pre-warmed process forks one encoder per picture.
-- **Runtime refusal vector** (`STRATA_GLM_ABLATE*`): six directions per layer projected out of the residual stream after every layer. No requantization — change its strength or switch it off in the config.
+- **Runtime refusal-vector hook** (`STRATA_GLM_ABLATE*`, off in the shipped config): projects refusal directions out of the residual stream; the MiMo vector is still in development (see below).
 - **Quantization toolchain** (`tools/mimo/`): calibration statistics with Russian text, imatrix/GPTQ quantization, the MTP-layer fix, refusal-direction capture and derivation, reference scripts, benchmarks.
 - **Tests**: decode and prefill attention against FP64 references (`tests/mimo_decode_attn_test.cu`, `tests/mimo_prefill_attention.cu`), the `mimo2` geometry loader (`tests/mimo_geometry_test.cpp`).
 
@@ -69,13 +71,12 @@ pip install -U huggingface_hub
 hf download nofacedfl/MiMo-V2.6-Pro-Uncensored-Maya --local-dir models/MiMo-V2.6-Pro-Uncensored-Maya
 ```
 
-About 302 GB: seven GGUF shards, `pack/` (the engine's index of those shards, the dense weights and the tokenizer; it finds the shards next to itself), `vision/` (the vision tower) and the refusal vector.
+About 302 GB: seven GGUF shards, `pack/` (the engine's index of those shards, the dense weights and the tokenizer; it finds the shards next to itself) and `vision/` (the vision tower).
 
 ### 3. Run
 
 ```bash
-tools/mimo/run-mimo-pro.sh                                           # uncensored: refusal vector on
-tools/mimo/run-mimo-pro.sh configs/mimo-pro-uncensored-novector.json  # without the vector
+tools/mimo/run-mimo-pro.sh
 ```
 
 - Chat in the browser: http://127.0.0.1:8098/
@@ -99,16 +100,21 @@ The shipped config is for 7 GPUs with ~320 GB of VRAM (GPU 1 of that machine lef
 | `STRATA_GLM_SPEC_SAMPLE=1`, `STRATA_GLM_LOOKUP=1` | speculative sampling of drafts; prompt-lookup drafts |
 | `STRATA_GLM_CPU_LANE=0`, `STRATA_GLM_PREFILL_CPU=0` | no experts on the CPU — faster here and (nearly) deterministic |
 | `STRATA_MIMO_KV8=1` | INT8 KV cache for the 10 full-attention layers |
-| `STRATA_GLM_ABLATE_SCALE=0.35`, `STRATA_GLM_ABLATE_TOKENS=64` | strength of the refusal vector, and how many answer tokens it steers (see below) |
 | `vision.gpu: true` | the vision tower on the first GPU (5.7 GB lent by the engine per picture) |
 | `STRATA_MIMO_DEV=1` | the `mimo2` path is marked experimental; the engine refuses it without this |
 
 With less VRAM, Maya's tiers still work: experts that do not fit are served from RAM (slower).
 
-## How the uncensoring works
+## Refusals and the refusal vector
 
-1. **The base** is [`pqhaz/MiMo-V2.6-Pro-MOPD-heretic`](https://huggingface.co/pqhaz/MiMo-V2.6-Pro-MOPD-heretic) (MIT): Xiaomi's MiMo-V2.6-Pro-MOPD with a two-stage directional ablation in its attention output projections. Through our quant it still refused 24 of 40 JailbreakBench requests.
-2. **Runtime refusal vector.** Six refusal directions per layer were measured from the residual stream on harmful vs harmless instructions (`tools/mimo/capture.py`, `derive.py`) and are projected out after every layer while generating. Strength 0.35 brings refusals to 1 / 40 and keeps short answers clean, but steering **every** token of a long answer piles up damage: 1000+-token Russian texts started to loop and coin words. So the vector steers only the prompt and the first 64 tokens of the answer (`STRATA_GLM_ABLATE_TOKENS=64`) — a refusal is decided at the start. Result: **5 / 40** refusals and clean long texts (0 of 4 long stories degraded, against 2–3 of 4 with the vector on every token).
+The weights are [`pqhaz/MiMo-V2.6-Pro-MOPD-heretic`](https://huggingface.co/pqhaz/MiMo-V2.6-Pro-MOPD-heretic) (MIT): Xiaomi's MiMo-V2.6-Pro-MOPD with a two-stage directional ablation of its refusal behaviour in the attention output projections. Through our quant it answers most requests the original refuses, but still refuses **24 of 40** JailbreakBench requests.
+
+**A runtime refusal vector is in development and is not shipped.** We measured six refusal directions per layer (harmful vs harmless instructions, `tools/mimo/capture.py`, `derive.py`) and projected them out while generating. It brought refusals to 1–5 / 40, but the tests beyond refusal counts showed two side effects:
+
+- with the vector on every token, 1000+-token Russian answers started to loop and coin words (limiting it to the first 64 answer tokens fixed that, `STRATA_GLM_ABLATE_TOKENS`);
+- even then, the model stopped saying "I don't know": asked about people, events and films that do not exist, it answered honestly in **1 of 10** cases with the vector against **6 of 10** without it, and invented confident details instead. Refusing and admitting ignorance share a direction.
+
+The next version will remove refusals without that side effect, checked on long answers, invented facts and agent tasks, not only on refusal counts. The engine hook stays available (`STRATA_GLM_ABLATE`, `_SCALE`, `_LAYERS`, `_TOKENS`) for anyone experimenting.
 
 The quant itself is calibrated with ~14 % Russian text: an earlier quant calibrated on English only had a Russian perplexity of 44.8. Details, numbers and dead ends: [docs/HOW-IT-WAS-MADE.md](docs/HOW-IT-WAS-MADE.md).
 
@@ -121,13 +127,12 @@ The quant itself is calibrated with ~14 % Russian text: an earlier quant calibra
 | `MiMo-V2.6-Pro-heretic-M23B-0000{1..7}-of-00007.gguf` | 300 GB |
 | `pack/` (engine index + dense weights + tokenizer + chat template) | 0.3 GB |
 | `vision/` (the vision tower, 364 `visual.*` tensors in BF16, + config) | 1.5 GB |
-| `refusal-vector-L70.f32` (70 layers × 6 directions × 6144, float32) | 10 MB |
 
 Quant recipe (`tools/mimo/recipes/m23.json`): routed experts IQ2_XXS gate/up and IQ2_S down (IQ2_XS / IQ3_XXS in the first and last layers), imatrix/GPTQ against full-precision calibration statistics; attention and the MTP layers Q4_K; router and norms F32. The tensor layout follows llama.cpp's `mimo2`; the tested runtime is this engine.
 
 ## Responsible use
 
-This model will answer requests that the original refuses. It is published for research, red-teaming, private use and creative work by adults. You are responsible for how you use it and for complying with the laws that apply to you. The output can be wrong or harmful; do not rely on it for medical, legal, safety-critical or other high-stakes decisions.
+This model answers many requests that the original refuses. It is published for research, red-teaming, private use and creative work by adults. You are responsible for how you use it and for complying with the laws that apply to you. The output can be wrong or harmful; do not rely on it for medical, legal, safety-critical or other high-stakes decisions.
 
 ## Credits and licenses
 

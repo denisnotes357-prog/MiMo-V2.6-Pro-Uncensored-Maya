@@ -42,7 +42,7 @@ Two problems on the way:
   raised it to 9.3, the English-only calibration did the rest. The final quant M23B is calibrated with ~14 % Russian
   text and has no baked vector: **Russian perplexity 4.03**.
 
-## 3. Refusals
+## 3. Refusals (the vector is in development)
 
 Through our quant the heretic base still refused 24 of 40 JailbreakBench requests (judged by the same quant without any
 vector). Six refusal directions per layer were measured from the residual stream on harmful vs harmless instructions
@@ -64,6 +64,12 @@ every token, 1000+-token Russian answers at temperature 1 started to loop ("Ям
 the same, without the vector nothing broke. A refusal is decided at the start of an answer, so the vector now steers the
 prompt and the first 64 answer tokens only (`STRATA_GLM_ABLATE_TOKENS`): 0 of 4 stories degraded, 5 / 40 refusals
 (256 tokens: 1 of 4 degraded, 4 / 40).
+
+**Invented facts.** A hallucination check (30 factual questions, 10 about people, events and films that do not exist)
+gave 30 / 30 facts either way, but with the vector the model admitted not knowing in **1 of 10** trap questions against
+**6 of 10** without it — it invented confident details instead. Refusing and saying "I don't know" share a direction.
+So the release ships **without** the vector (24 / 40 refusals from the abliterated base); a vector that leaves honesty
+intact, checked on long answers, invented facts and agent tasks, is the next step.
 
 ## 4. The engine port
 

@@ -65,7 +65,7 @@ first GPU's expert pool while a picture is encoded and takes it back afterwards.
 tower loaded, no CUDA) forks one encoder per picture: ~1.6 s from request to features. Image rows replace the
 `<|image_pad|>` tokens on plain 1-D positions.
 
-## The refusal vector
+## The refusal vector (experimental, not shipped)
 
 `STRATA_GLM_ABLATE=<file>`, `STRATA_GLM_ABLATE_LAYERS=70`, `STRATA_GLM_ABLATE_SCALE=s`: after every layer the residual
 stream loses `s` times its projection onto that layer's directions (`src/core/glm_ablate.cuh`; for MiMo 6 directions a

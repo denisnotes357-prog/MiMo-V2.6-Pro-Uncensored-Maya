@@ -37,16 +37,12 @@
   "STRATA_GLM_MTP_PIPE": "1",
   "STRATA_GLM_MTP_DRAFT": "7",
   "STRATA_GLM_MTP_PIPE_FRESH": "0",
-  "STRATA_GLM_ABLATE": "models/MiMo-V2.6-Pro-Uncensored-Maya/refusal-vector-L70.f32",
-  "STRATA_GLM_ABLATE_LAYERS": "70",
-  "STRATA_GLM_ABLATE_SCALE": "0.35",
   "STRATA_MIMO_MTP3": "1",
   "STRATA_GLM_SPEC_SAMPLE": "1",
   "STRATA_GLM_CPU_LANE": "0",
   "STRATA_GLM_PREFILL_CPU": "0",
   "STRATA_GLM_LOOKUP": "1",
-  "STRATA_MIMO_KV8": "1",
-  "STRATA_GLM_ABLATE_TOKENS": "64"
+  "STRATA_MIMO_KV8": "1"
  },
  "vision": {
   "exe": "tools/mimo/mimo_vision.py",

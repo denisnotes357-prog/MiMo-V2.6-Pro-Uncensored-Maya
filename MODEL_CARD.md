@@ -21,9 +21,8 @@ language:
 
 # MiMo-V2.6-Pro Uncensored on Maya
 
-Xiaomi's ~1-trillion-parameter **MiMo-V2.6-Pro**, uncensored, quantized to ~2 bits (300 GB) for the
-[Maya](https://github.com/denisnotes357-prog/MiMo-V2.6-Pro-Uncensored-Maya) engine, with its own vision tower and a
-runtime refusal vector. On 5× RTX 4090 48 GB + 2× A100 40 GB: **55–58 tok/s in Russian, 71–75 tok/s on code,
+Xiaomi's ~1-trillion-parameter **MiMo-V2.6-Pro** (the abliterated "heretic" base), quantized to ~2 bits (300 GB) for the
+[Maya](https://github.com/denisnotes357-prog/MiMo-V2.6-Pro-Uncensored-Maya) engine, with its own vision tower. On 5× RTX 4090 48 GB + 2× A100 40 GB: **55–58 tok/s in Russian, 71–75 tok/s on code,
 106–116 tok/s when the answer repeats the context, 38–40 tok/s at 200K context**, 512K context, an image in ~1.6 s.
 
 **Engine, code and full documentation:** https://github.com/denisnotes357-prog/MiMo-V2.6-Pro-Uncensored-Maya
@@ -35,7 +34,6 @@ runtime refusal vector. On 5× RTX 4090 48 GB + 2× A100 40 GB: **55–58 tok/s 
 | `MiMo-V2.6-Pro-heretic-M23B-0000{1..7}-of-00007.gguf` | 300 GB | the quantized model (llama.cpp `mimo2` layout) |
 | `pack/` | 0.3 GB | Maya's index of the shards, the dense weights in the layout the kernels read, the tokenizer and chat template |
 | `vision/` | 1.5 GB | the model's own vision transformer (364 `visual.*` tensors, BF16, byte-identical to the checkpoint) + config |
-| `refusal-vector-L70.f32` | 10 MB | 6 refusal directions per layer (70 × 6 × 6144 float32), applied by the engine at runtime |
 
 ## Use
 
@@ -48,7 +46,7 @@ tools/mimo/run-mimo-pro.sh                                # http://127.0.0.1:809
 ```
 
 The shipped config (`configs/mimo-pro-uncensored.json`) is for 7 GPUs with ~320 GB VRAM; adjust the GPU list and the
-layer split to yours. Without the refusal vector: `configs/mimo-pro-uncensored-novector.json`.
+layer split to yours.
 
 The GGUF shards follow llama.cpp's `mimo2` layout, but this release is built and tested only with the Maya engine (its
 MTP drafting, attention kernels, INT8 KV cache and vision path are what the numbers above measure).
@@ -61,17 +59,11 @@ MTP drafting, attention kernels, INT8 KV cache and vision path are what the numb
   imatrix/GPTQ against statistics of the full-precision model, calibration with ~14 % Russian text; attention and the
   three MTP layers Q4_K (their fused q/k/v re-dequantized tensor-parallel-aware — the stock conversion scrambles them);
   router and norms F32.
-- **Refusal vector:** six directions per layer measured on harmful vs harmless instructions, projected out of the
-  residual stream after every layer at strength 0.35 — for the prompt and the first 64 answer tokens only
-  (`STRATA_GLM_ABLATE_TOKENS=64`): steering every token made long Russian answers loop.
 
-| Strength of the vector | Russian perplexity | English perplexity | JailbreakBench refusals / 40 |
-| --- | --- | --- | --- |
-| 0 | 4.03 | 4.25 | 24 |
-| 0.35, every token | 5.12 | 4.06 | 1 (long answers degrade) |
-| **0.35, first 64 tokens (default)** | — | — | **5** |
-
-(The full-precision model: Russian perplexity ≈ 3.8. Refusals judged by the same quant without the vector.)
+**Refusals:** the abliterated base refuses 24 of 40 JailbreakBench requests through this quant. Facts 30 / 30 correct;
+about things that do not exist it answers "unknown" honestly in 6 of 10 cases; long Russian answers stay clean.
+A runtime refusal vector is in development: it cut refusals to 1–5 / 40 but made the model invent confident answers
+about non-existent things (honest 1 / 10), so it is not shipped.
 
 Details: [How it was made](https://github.com/denisnotes357-prog/MiMo-V2.6-Pro-Uncensored-Maya/blob/main/docs/HOW-IT-WAS-MADE.md).
 
