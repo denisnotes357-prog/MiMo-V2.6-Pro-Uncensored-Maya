@@ -1590,7 +1590,15 @@ static int glm_pack_generate(const Options& o) {
                 reuse = back;
             }
         }
-        if (reuse == 0) model.reset();
+        if (reuse == 0) {
+            model.reset();
+            // the snapshot no longer describes the state: a reset prompt that ends early (a client that disconnects
+            // while it is read) left snap_tokens naming the previous conversation, and that conversation's next turn
+            // restored its rings over the zeroed caches - mimo2's full-attention KV is positional and not in the
+            // snapshot - and answered with garbage from the first token (2026-10-20: an agent session after another client's cancelled request)
+            snap_tokens.clear();
+            snap_in_slot = false;
+        }
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
         std::vector<float> lg;
         t0 = std::chrono::steady_clock::now();

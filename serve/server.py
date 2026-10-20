@@ -2195,9 +2195,20 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
-    """One compact line per request while diagnosing blank/empty turns. Set STRATA_DEBUG=1 to enable."""
+    """One compact line per request while diagnosing blank/empty turns. Set STRATA_DEBUG=1 to enable.
+    STRATA_DEBUG_DUMP=DIR also keeps each request's whole body there (req-<time>-<n>.json) to replay a bad answer."""
     if not os.environ.get("STRATA_DEBUG"):
         return
+    dump = os.environ.get("STRATA_DEBUG_DUMP")
+    if dump:
+        try:
+            _debug_req.n = getattr(_debug_req, "n", 0) + 1
+            Path(dump).mkdir(parents=True, exist_ok=True)
+            name = f"req-{time.strftime('%H%M%S')}-{_debug_req.n:05d}-{api}-{prompt_tokens}.json"
+            (Path(dump) / name).write_text(json.dumps(req, ensure_ascii=False), encoding="utf-8")
+            print(f"[maya] dump: {name}", flush=True)
+        except Exception as e:   # (diagnostics never fail a request)
+            print(f"[maya] dump failed: {e}", flush=True)
     last = messages[-1] if messages else {}
     body = last.get("content")
     if isinstance(body, list):
@@ -3410,11 +3421,15 @@ def main() -> int:
         vcfg = cfg.get("vision") or None
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
         venv = dict(env)
+        # "device": a card of its own for the encoder (numbered as nvidia-smi, outside the model's "gpu" list): it stays
+        # loaded there and the model lends it nothing (lending the expert pool's tail and taking it back corrupted
+        # experts on a server that had run a while - mimo2, 2026-10-19/20)
+        vdev = vcfg.get("device") if vcfg else None
         if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") != "hip":
-            venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
+            venv["CUDA_VISIBLE_DEVICES"] = str(vdev if vdev is not None else gpu_list(cfg)[0])   # else the first GPU
         # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
         # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
-        on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident")
+        on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident") and vdev is None
         engine_env = env
         if on_demand:
             fp = vision_footprint(vcfg, venv, Path(a.config).resolve().with_name("vision-memory.json"),

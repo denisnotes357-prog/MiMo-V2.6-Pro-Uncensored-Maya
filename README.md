@@ -1,8 +1,8 @@
 # MiMo-V2.6-Pro Uncensored on Maya
 
-**Xiaomi's ~1-trillion-parameter MiMo-V2.6-Pro (abliterated "heretic" base), with its own vision, running at 55–75 tokens/s on seven GPUs with a 512K context.**
+**Xiaomi's ~1-trillion-parameter MiMo-V2.6-Pro (abliterated "heretic" base), with its own vision, running at 58–85 tokens/s on seven GPUs with a 512K context.**
 
-This repository is a fork of [Project Maya](https://github.com/mw00/project-maya) (MIT), the engine that runs large MoE models on your own GPUs. Maya did not know MiMo. Here the engine is ported to **MiMo-V2.6-Pro** (architecture `mimo2`: 70 layers, 384 experts, hybrid sliding-window + full attention with sinks, three multi-token-prediction layers, a native vision tower), a calibrated ~2-bit quant is built for it (300 GB, Russian kept intact), and decoding is made fast enough for daily use — from 31 tok/s at the first working build to 55–75 tok/s now, and from 20 to 38–40 tok/s at 200K context.
+This repository is a fork of [Project Maya](https://github.com/mw00/project-maya) (MIT), the engine that runs large MoE models on your own GPUs. Maya did not know MiMo. Here the engine is ported to **MiMo-V2.6-Pro** (architecture `mimo2`: 70 layers, 384 experts, hybrid sliding-window + full attention with sinks, three multi-token-prediction layers, a native vision tower), a calibrated ~2-bit quant is built for it (300 GB, Russian kept intact), and decoding is made fast enough for daily use — from 31 tok/s at the first working build to 58–85 tok/s now, and from 20 to 38–40 tok/s at 200K context.
 
 [Русская версия](README.ru.md) · [How it was made](docs/HOW-IT-WAS-MADE.md) · [Engine port](docs/MIMO2-ENGINE-PORT.md) · [Model on Hugging Face](#download-the-model) · [GLM-5.3 Uncensored on Maya](https://github.com/denisnotes357-prog/GLM-5.3-Uncensored-Maya) · [Original Project Maya README](README.project-maya.md)
 
@@ -16,19 +16,19 @@ Measured on 5× RTX 4090 48 GB + 2× A100 40 GB (320 GB VRAM), 503 GB RAM; 400-t
 | --- | ---: |
 | Refusals on 40 JailbreakBench requests | 24 / 40 (the abliterated base; a runtime refusal vector is [in development](#refusals-and-the-refusal-vector)) |
 | Factual questions / questions about things that do not exist | 30 / 30 correct / 6 of 10 answered "unknown" honestly |
-| Long answers (3 × ~9000-character Russian scenes, temperature 1, `rep_test.py`) | no repeated lines or broken words (identical to plain sampling); an earlier check that only looked for adjacent repeats missed a bug, see below |
-| Decode, Russian / code, temperature 0 | **55–58 / 71–75 tok/s** |
+| Long answers (3 × ~9000-character Russian scenes, temperature 1, `rep_test.py`) | no repeated lines or broken words (identical to plain sampling); an earlier check that only looked for adjacent repeats missed a bug (see *Speculative sampling* under What is in here) |
+| Decode, Russian / code, temperature 0 | **63–69 / 85 tok/s** |
 | Decode, Russian / code, temperature 1 | **58–63 / 81 tok/s** |
 | Decode when the answer repeats the context (code edits, proofreading) | **106–116 tok/s** |
 | Decode at 100K / 200K context | **38 / 38–40 tok/s** |
 | Prompt reading | **1500–1900 tok/s**; a 200K prompt in 155 s; a short chat turn in 0.15 s |
 | A new question to an already-read 200K conversation | **~1 s** (only its own tokens are read) |
 | An image | **~1.6 s** to encode (the model's own vision tower, on the GPU) |
-| Context | **512K** (with the INT8 KV cache ~200–330 of the 26,880 experts live in RAM and are fetched when routed) |
+| Context | **512K** (with the INT8 KV cache a few hundred experts live in RAM and are fetched when routed) |
 | Russian / English perplexity (full-precision model ≈ 3.8 in Russian) | 4.03 / 4.25 |
 | Size | 300 GB GGUF + 0.3 GB pack + 1.5 GB vision tower |
 
-Speed history on that machine: 31 tok/s (plain decoding) → 45 / 59 (one MTP layer, pipelined window) → 52 / 66 (all three MTP layers, as the model was trained) → **55–58 / 71–75** at t = 0 (no CPU lane, prompt lookup). Long context: 7.4 tok/s at 70K → 32 (split-K attention) → **38–40 at 200K** (tensor-core attention + INT8 KV cache).
+Speed history on that machine: 31 tok/s (plain decoding) → 45 / 59 (one MTP layer, pipelined window) → 52 / 66 (all three MTP layers, as the model was trained) → **63–69 / 85** at t = 0 (no CPU lane, prompt lookup). Long context: 7.4 tok/s at 70K → 32 (split-K attention) → **38–40 at 200K** (tensor-core attention + INT8 KV cache).
 
 ## What is in here
 
@@ -43,6 +43,12 @@ Speed history on that machine: 31 tok/s (plain decoding) → 45 / 59 (one MTP la
 - **Runtime refusal-vector hook** (`STRATA_GLM_ABLATE*`, off in the shipped config): projects refusal directions out of the residual stream; the MiMo vector is still in development (see below).
 - **Quantization toolchain** (`tools/mimo/`): calibration statistics with Russian text, imatrix/GPTQ quantization, the MTP-layer fix, refusal-direction capture and derivation, reference scripts, benchmarks.
 - **Tests**: decode and prefill attention against FP64 references (`tests/mimo_decode_attn_test.cu`, `tests/mimo_prefill_attention.cu`), the `mimo2` geometry loader (`tests/mimo_geometry_test.cpp`).
+
+## Fixes of 2026-10-20 (update if you cloned earlier)
+
+- **Agent sessions could turn into garbage.** When one client's new conversation was dropped while its prompt was being read, the engine kept the previous conversation's snapshot record although it had already reset the caches; that conversation's next turn restored its sliding-window rings over zeroed full-attention caches and answered with nonsense from the first token (invented tool results, tools that do not exist). A reset now invalidates the snapshot. Reproduced with the exact request sequence (2 of 2 broken before, correct after).
+- **`<think>` leaked into the reasoning.** MiMo opens its thinking itself; the server passed that tag on, agents sent it back in the history, and the model doubled it every turn. The server now strips it from answers and from returned history.
+- Speculative sampling is off in the shipped config (see below).
 
 ## Quick start
 
@@ -98,9 +104,9 @@ The shipped config is for 7 GPUs with ~320 GB of VRAM (GPU 1 of that machine lef
 | `--max-context 512000` | with `STRATA_MIMO_KV8=1`; on this machine ~200–330 experts then live in RAM (the `glm stat` line shows `vram`/`ram`) |
 | `STRATA_MIMO_MTP3=1`, `STRATA_GLM_MTP_PIPE=1`, `STRATA_GLM_MTP_DRAFT=7` | native three-layer MTP drafting, verified as a pipelined window |
 | `STRATA_GLM_SPEC_SAMPLE=0`, `STRATA_GLM_LOOKUP=1` | speculative sampling off (with lookup it garbles long sampled answers); prompt-lookup drafts on |
-| `STRATA_GLM_CPU_LANE=0`, `STRATA_GLM_PREFILL_CPU=0` | no experts on the CPU — faster here and (nearly) deterministic |
+| `STRATA_GLM_CPU_LANE=0`, `STRATA_GLM_PREFILL_CPU=0` | no experts on the CPU — faster here (greedy output still varies slightly between runs on the seven-GPU pipeline) |
 | `STRATA_MIMO_KV8=1` | INT8 KV cache for the 10 full-attention layers |
-| `vision.gpu: true` | the vision tower on the first GPU (5.7 GB lent by the engine per picture) |
+| `vision.gpu: true` | the vision tower on the first GPU (5.7 GB lent by the engine per picture); `"device": N` runs it on a card of its own instead, with nothing lent |
 | `STRATA_MIMO_DEV=1` | the `mimo2` path is marked experimental; the engine refuses it without this |
 
 With less VRAM, Maya's tiers still work: experts that do not fit are served from RAM (slower).

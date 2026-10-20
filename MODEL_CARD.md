@@ -22,7 +22,7 @@ language:
 # MiMo-V2.6-Pro Uncensored on Maya
 
 Xiaomi's ~1-trillion-parameter **MiMo-V2.6-Pro** (the abliterated "heretic" base), quantized to ~2 bits (300 GB) for the
-[Maya](https://github.com/denisnotes357-prog/MiMo-V2.6-Pro-Uncensored-Maya) engine, with its own vision tower. On 5× RTX 4090 48 GB + 2× A100 40 GB: **55–58 tok/s in Russian, 71–75 tok/s on code,
+[Maya](https://github.com/denisnotes357-prog/MiMo-V2.6-Pro-Uncensored-Maya) engine, with its own vision tower. On 5× RTX 4090 48 GB + 2× A100 40 GB: **63–69 tok/s in Russian, 85 tok/s on code (temperature 0),
 106–116 tok/s when the answer repeats the context, 38–40 tok/s at 200K context**, 512K context, an image in ~1.6 s.
 
 **Engine, code and full documentation:** https://github.com/denisnotes357-prog/MiMo-V2.6-Pro-Uncensored-Maya
@@ -71,6 +71,7 @@ Details: [How it was made](https://github.com/denisnotes357-prog/MiMo-V2.6-Pro-U
 
 - ~2-bit experts: the answers are good but not identical to the full model; at temperature 1 Russian sometimes picks
   odd words. Lower the temperature for precise work.
+- 2026-10-20: the engine fixes two causes of garbage in long agent sessions (a stale conversation snapshot after a dropped request, and a leaked `<think>` tag) — update the engine from GitHub.
 - 2026-10-19: speculative sampling of the drafts (`STRATA_GLM_SPEC_SAMPLE=1`) together with prompt-lookup drafts garbled
   long answers at temperature 1; the shipped config now keeps it off (update `configs/mimo-pro-uncensored.json` if you
   cloned earlier).
